@@ -16,6 +16,7 @@ import argparse
 import json
 import math
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -153,7 +154,7 @@ def scale_filter(width):
     return f"scale={width}:-2:flags=lanczos" if width else "null"
 
 
-def interpolate_rife(rife, ffmpeg, args, src_fps, target_fps, work, progress, clip):
+def interpolate_rife(rife, ffmpeg, args, src_fps, target_fps, work, progress, clip, rife_hi=0.7):
     """Extract frames, run RIFE to hit target_fps exactly, return (pattern, fps)."""
     src_dir = work / "src"
     out_dir = work / f"rife_{target_fps}"
@@ -164,7 +165,7 @@ def interpolate_rife(rife, ffmpeg, args, src_fps, target_fps, work, progress, cl
     if not any(src_dir.iterdir()):
         run([
             ffmpeg, "-hide_banner", "-y", *trim_args(args), "-i", args.input,
-            "-vf", scale_filter(args.width), "-fps_mode", "passthrough",
+            "-vf", scale_filter(args.width), "-fps_mode", "passthrough", "-pix_fmt", "rgb24",  # RIFE misreads RGBA
             str(src_dir / "%08d.png"),
         ], on_progress=timed(report, clip))
 
@@ -176,7 +177,7 @@ def interpolate_rife(rife, ffmpeg, args, src_fps, target_fps, work, progress, cl
     if len(list(out_dir.glob("*.png"))) != n_out:  # reuse frames across formats at the same fps
         model = Path(rife).parent / args.rife_model
         print(f"  RIFE: {n_in} frames @ {src_fps:.3f} fps -> {n_out} frames @ {target_fps} fps")
-        report = progress.stage(0.1, 0.7, "Interpolating with RIFE")
+        report = progress.stage(0.1, rife_hi, "Interpolating with RIFE")
         done = threading.Event()
 
         def watch():  # RIFE prints no progress, so count the frames it has written
@@ -206,7 +207,8 @@ def interpolate_ffmpeg(args, target_fps):
     return [*trim_args(args), "-i", args.input], vf
 
 
-def encode(ffmpeg, fmt, inputs, vf, fps, out, on_progress=None):
+def encode(ffmpeg, fmt, inputs, vf, fps, out, on_progress=None, alpha=False, bg="black"):
+    """Encode one output. alpha=(width, height) means the input frames carry transparency (background removed)."""
     base = [ffmpeg, "-hide_banner", "-y", *inputs]
     if fmt == "gif":
         # Build one palette tuned to this clip, then dither against it.
@@ -218,13 +220,20 @@ def encode(ffmpeg, fmt, inputs, vf, fps, out, on_progress=None):
         run([*base, "-filter_complex", graph, "-loop", "0", out], on_progress=on_progress)
     elif fmt == "webp":
         # compression_level 6 is ~25x slower than 4 for ~2% smaller files.
-        run([*base, "-vf", f"{vf},fps={fps}", "-c:v", "libwebp_anim",
+        run([*base, "-vf", f"{vf},fps={fps}", "-c:v", "libwebp_anim", *(["-pix_fmt", "yuva420p"] if alpha else []),
              "-quality", "85", "-compression_level", "4", "-loop", "0", out], on_progress=on_progress)
     elif fmt == "apng":
         run([*base, "-vf", f"{vf},fps={fps}", "-c:v", "apng", "-plays", "0", "-f", "apng", out], on_progress=on_progress)
     elif fmt == "mp4":
-        # Silent, web-friendly H.264 that plays inline like a GIF.
-        run([*base, "-vf", f"{vf},fps={fps}", "-an", "-c:v", "libx264", "-preset", "slow",
+        # Silent, web-friendly H.264 that plays inline like a GIF. H.264 has no transparency,
+        # so a cutout is laid over a solid background colour.
+        if alpha:
+            w, h = alpha
+            graph = f"color=c={bg}:s={w}x{h}:r={fps}[c];[0:v]{vf},fps={fps}[fg];[c][fg]overlay=shortest=1"
+            filters = ["-filter_complex", graph]
+        else:
+            filters = ["-vf", f"{vf},fps={fps}"]
+        run([*base, *filters, "-an", "-c:v", "libx264", "-preset", "slow",
              "-crf", "23", "-pix_fmt", "yuv420p", "-movflags", "+faststart", out],
             on_progress=on_progress)
 
@@ -243,6 +252,9 @@ def main():
                    help="interpolation engine (default: RIFE if installed, else FFmpeg)")
     p.add_argument("--rife-model", default="rife-v4.6", help="RIFE model folder (default: rife-v4.6)")
     p.add_argument("--gpu", type=int, help="GPU id for RIFE (-1 = CPU)")
+    p.add_argument("--remove-bg", action="store_true",
+                   help="cut out the background with AI (transparent in WebP/APNG/GIF; needs matting model)")
+    p.add_argument("--bg-color", default="black", help="background colour for MP4 when using --remove-bg")
     p.add_argument("--keep-temp", action="store_true", help="keep extracted/interpolated frames")
     p.add_argument("-v", "--verbose", action="store_true")
     p.add_argument("--progress", action="store_true", help=argparse.SUPPRESS)  # machine-readable, for the GUI
@@ -260,6 +272,12 @@ def main():
         ext = Path(args.output).suffix.lower().lstrip(".")
         args.format = {"png": "apng"}.get(ext, ext) if ext in (*FORMATS, "png") else "gif"
     formats = FORMATS if args.format == "all" else (args.format,)
+
+    if args.remove_bg:
+        import matting
+        ok, msg = matting.status()
+        if not ok:
+            sys.exit(f"{msg}. Run: python setup_tools.py --matting")
 
     rife = find_exe("rife-ncnn-vulkan") if args.engine in ("auto", "rife") else None
     if args.engine == "rife" and not rife:
@@ -293,14 +311,30 @@ def main():
                 print("  source already at/above target fps; resampling only")
                 inputs, vf = [*trim_args(args), "-i", str(inp)], scale_filter(args.width)
             elif engine == "rife":
-                inputs, vf = interpolate_rife(rife, ffmpeg, args, info["fps"], fps, work, progress, clip)
+                inputs, vf = interpolate_rife(rife, ffmpeg, args, info["fps"], fps, work, progress, clip,
+                                              rife_hi=0.5 if args.remove_bg else 0.7)
                 interpolated = True
             else:
                 inputs, vf = interpolate_ffmpeg(args, fps)
 
+            encode_lo = 0.7 if interpolated else 0
+            if args.remove_bg:
+                # Cut out every final frame (after interpolation: RIFE ignores alpha), once per fps.
+                lo, encode_lo = (0.5, 0.8) if interpolated else (0, 0.6)
+                report = progress.stage(lo, encode_lo, "Removing background")
+                matte_dir = work / f"matte_{fps}"
+                if not (matte_dir / "done").is_file():
+                    print("  removing background (AI)")
+                    matting.matte_frames(ffmpeg, inputs, f"{vf},fps={fps}", fps, matte_dir, round(clip * fps), report)
+                    (matte_dir / "done").touch()
+                inputs, vf = ["-framerate", str(fps), "-i", str(matte_dir / "%08d.png")], "null"
+                with open(matte_dir / "00000001.png", "rb") as f:
+                    cutout_size = struct.unpack(">II", f.read(24)[16:24])  # PNG IHDR width, height
+
             # libwebp_anim only emits output when it finishes, so FFmpeg reports no progress for it.
-            report = progress.stage(0.7 if interpolated else 0, 1, f"Encoding {fmt.upper()}", busy=fmt == "webp")
-            encode(ffmpeg, fmt, inputs, vf, fps, out, on_progress=timed(report, clip))
+            report = progress.stage(encode_lo, 1, f"Encoding {fmt.upper()}", busy=fmt == "webp")
+            encode(ffmpeg, fmt, inputs, vf, fps, out, on_progress=timed(report, clip),
+                   alpha=cutout_size if args.remove_bg else None, bg=args.bg_color)
             report(1)
             size = out.stat().st_size / 1024 / 1024
             print(f"  done: {size:.2f} MB")

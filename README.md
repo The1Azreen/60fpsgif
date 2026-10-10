@@ -38,6 +38,13 @@ python setup_tools.py
 
 This downloads [rife-ncnn-vulkan](https://github.com/nihui/rife-ncnn-vulkan) into `tools/`. It runs on any Vulkan-capable GPU (NVIDIA / AMD / Intel). Without it, the tool falls back to FFmpeg's `minterpolate` (CPU, more artifacts).
 
+- Optional: AI background removal (see [below](#remove-the-background)):
+
+```
+pip install -r requirements.txt
+python setup_tools.py --matting
+```
+
 ## Desktop app
 
 ![60fps GIF Maker desktop app](readme_image/app.png)
@@ -73,6 +80,22 @@ python fpsgif.py clip.mp4 -s 3 -t 4 -w 360     # 4 s starting at 0:03, 360 px wi
 | `--engine` | `auto`, `rife`, or `ffmpeg` |
 | `--rife-model` | RIFE model folder (default `rife-v4.6`; try `rife-anime` for cartoons) |
 | `--gpu` | GPU id for RIFE (`-1` = CPU) |
+| `--remove-bg` | Cut out the background with AI (see below) |
+| `--bg-color` | Background colour for MP4 with `--remove-bg` (default `black`) |
+
+## Remove the background
+
+`--remove-bg` (or **Remove background (AI)** in the app) cuts out the person or character and makes everything else transparent. The app previews the cutout on a checkerboard before you convert.
+
+It uses [RobustVideoMatting](https://github.com/PeterL1n/RobustVideoMatting), a 15 MB video matting model run through onnxruntime. Unlike single-image cutout models it carries information from frame to frame, so the edges stay steady instead of flickering. It runs on the CPU at about 15 ms per 480 px frame, so a 10 s clip adds roughly 10 s. To use a GPU, install `onnxruntime-directml` (any DirectX 12 GPU on Windows) or `onnxruntime-gpu` (NVIDIA CUDA) instead of `onnxruntime`.
+
+| Format | Result |
+|---|---|
+| WebP / APNG | Smooth, semi-transparent edges |
+| GIF | Transparent, but GIF can only make a pixel fully on or off, so edges are harder |
+| MP4 | H.264 can't be transparent, so the background becomes a solid colour (`--bg-color`) |
+
+The cutout runs after interpolation, on every final frame, because RIFE ignores transparency. It works best on clearly visible people or characters. Fast motion blur, particles and glow effects can leave soft or flickering edges.
 
 ## Why GIFs are capped at 50 fps
 

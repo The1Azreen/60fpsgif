@@ -1,4 +1,9 @@
-"""Download RIFE (rife-ncnn-vulkan) into ./tools for AI frame interpolation."""
+"""Download optional AI tools into ./tools.
+
+    python setup_tools.py             RIFE (rife-ncnn-vulkan) for frame interpolation
+    python setup_tools.py --matting   RobustVideoMatting model for background removal
+                                      (also needs: pip install -r requirements.txt)
+"""
 
 import io
 import sys
@@ -15,7 +20,27 @@ ROOT = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__
 TOOLS = ROOT / "tools"
 
 
+MATTING_URL = "https://github.com/PeterL1n/RobustVideoMatting/releases/download/v1.0.0/rvm_mobilenetv3_fp32.onnx"
+MATTING_MODEL = TOOLS / "rvm_mobilenetv3_fp32.onnx"
+
+
+def install_matting():
+    if MATTING_MODEL.is_file():
+        print(f"Background removal model already installed: {MATTING_MODEL}")
+        return
+    print(f"Downloading {MATTING_URL}")
+    TOOLS.mkdir(exist_ok=True)
+    part = MATTING_MODEL.with_suffix(".part")
+    with urllib.request.urlopen(MATTING_URL) as r, open(part, "wb") as f:
+        while chunk := r.read(1 << 20):
+            f.write(chunk)
+    part.replace(MATTING_MODEL)
+    print(f"Installed background removal model to {MATTING_MODEL}")
+
+
 def main():
+    if "--matting" in sys.argv[1:]:
+        return install_matting()
     if list(TOOLS.glob("**/rife-ncnn-vulkan*")):
         print(f"RIFE already installed in {TOOLS}")
         return

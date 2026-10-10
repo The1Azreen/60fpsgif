@@ -3,8 +3,10 @@
     pip install pyinstaller
     python build_exe.py
 
-The result is dist/60fps GIF Maker.exe. FFmpeg still needs to be on PATH. RIFE is
-looked up in a tools/ folder next to the .exe (the app's "Install RIFE" button puts it there).
+The result is dist/60fps GIF Maker.exe. FFmpeg still needs to be on PATH. RIFE and the
+background removal model are looked up in a tools/ folder next to the .exe (the app's
+"Install RIFE" / "Install AI cutout" buttons put them there). For background removal,
+build with numpy and onnxruntime installed (pip install -r requirements.txt) so they get bundled.
 """
 
 import subprocess
@@ -13,11 +15,16 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 SEP = ";" if sys.platform == "win32" else ":"
+# Big optional packages that numpy / onnxruntime might import if present; the app needs none of them.
+EXCLUDE = ["torch", "torchvision", "torchaudio", "xformers", "transformers", "bitsandbytes", "tensorflow",
+           "scipy", "pandas", "matplotlib", "numba", "llvmlite", "sympy", "cv2", "IPython", "jedi",
+           "librosa", "datasets", "nltk", "moviepy", "imageio", "lxml", "openpyxl", "grpc", "pyarrow", "PIL"]
 
 subprocess.run([
     sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean", "--onefile", "--windowed",
     "--name", "60fps GIF Maker", "--icon", str(ROOT / "icon.ico"),
     "--add-data", f"{ROOT / 'icon.ico'}{SEP}.",
+    *[arg for mod in EXCLUDE for arg in ("--exclude-module", mod)],
     str(ROOT / "fpsgif_gui.pyw"),
 ], cwd=ROOT, check=True)
 print(f"\nBuilt: {ROOT / 'dist' / '60fps GIF Maker.exe'}")

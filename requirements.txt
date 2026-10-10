@@ -1,0 +1,5 @@
+# Optional: AI background removal (--remove-bg / "Remove background" in the app).
+# Swap onnxruntime for onnxruntime-directml (any DirectX 12 GPU on Windows) or
+# onnxruntime-gpu (NVIDIA CUDA) to run it on the GPU.
+numpy
+onnxruntime>=1.16

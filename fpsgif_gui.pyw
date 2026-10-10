@@ -19,6 +19,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 import fpsgif
+import matting
 import setup_tools
 
 ROOT = fpsgif.ROOT
@@ -253,11 +254,17 @@ class FrameSource:
                 args = self.pending.pop(kind)
             self.results.put((kind, args, self.grab(kind, *args)))
 
-    @staticmethod
-    def grab(kind, path, *rest):
+    matter = None
+
+    def grab(self, kind, path, *rest):
         if kind == "frame":
-            t, w, h = rest
+            t, w, h, cutout = rest
             pre, vf = ["-ss", f"{t:.3f}"], f"scale={w}:{h}:force_original_aspect_ratio=decrease"
+            if cutout:
+                try:
+                    return self.cutout_frame(path, pre, vf)
+                except Exception:
+                    pass  # model missing or failed: fall back to the plain frame
         else:  # filmstrip from keyframes only: fast even for long videos
             duration, n, tw, th = rest
             pre = ["-skip_frame", "nokey"]
@@ -271,15 +278,36 @@ class FrameSource:
             out = b""
         return base64.b64encode(out).decode() if out else None
 
+    def cutout_frame(self, path, pre, vf):
+        """The frame with its background removed, over a checkerboard, as PPM bytes for Tk."""
+        import io
+        import numpy as np
+        cmd = [fpsgif.find_exe("ffmpeg"), "-hide_banner", "-loglevel", "error", *pre, "-i", path, "-an",
+               "-vf", vf, "-frames:v", "1", "-f", "image2pipe", "-c:v", "ppm", "-"]
+        out = subprocess.run(cmd, capture_output=True, timeout=30, creationflags=NO_WINDOW).stdout
+        rgb = next(matting.read_ppm(io.BytesIO(out)))
+        if self.matter is None:
+            self.matter = matting.Matter()
+        self.matter.reset()  # a lone frame has no history; a second pass lets the model settle
+        self.matter(rgb)
+        rgba = self.matter(rgb).astype(np.float32) / 255
+        h, w = rgba.shape[:2]
+        y, x = np.mgrid[0:h, 0:w]
+        cell = max(px(8), 4)
+        board = np.where(((y // cell) + (x // cell)) % 2, 0x2a, 0x3a).astype(np.float32)[..., None] / 255
+        a = rgba[..., 3:]
+        img = ((rgba[..., :3] * a + board * (1 - a)) * 255 + 0.5).astype(np.uint8)
+        return b"P6\n%d %d\n255\n" % (w, h) + img.tobytes()
+
 
 class TrimPanel(ttk.Frame):
     """Frame preview plus a timeline with draggable start/end handles, synced to the trim fields."""
 
     STRIP_H = 44
 
-    def __init__(self, parent, start_var, duration_var):
+    def __init__(self, parent, start_var, duration_var, cutout_var):
         super().__init__(parent, style="Card.TFrame")
-        self.start_var, self.duration_var = start_var, duration_var
+        self.start_var, self.duration_var, self.cutout_var = start_var, duration_var, cutout_var
         self.path, self.duration, self.fps = None, 0.0, 30.0
         self.start = self.end = self.head = 0.0
         self.drag = None
@@ -316,6 +344,7 @@ class TrimPanel(ttk.Frame):
             self.timeline.bind(f"<Shift-{key[1:]}", lambda e, s=step: self.step(s))
         for var in (start_var, duration_var):
             var.trace_add("write", lambda *_: self.from_fields())
+        cutout_var.trace_add("write", lambda *_: self.request_frame())
         self.after(30, self.poll)
 
     # ----- data -----
@@ -344,7 +373,7 @@ class TrimPanel(ttk.Frame):
         w, h = self.preview.winfo_width() - 2, self.preview.winfo_height() - 2
         if w > 10 and h > 10:
             t = min(self.head, max(self.duration - 1.5 / self.fps, 0))  # seeking past the last frame yields nothing
-            self.frames.request("frame", self.path, round(t, 3), w, h)
+            self.frames.request("frame", self.path, round(t, 3), w, h, bool(self.cutout_var.get()))
 
     def request_strip(self):
         if not self.path:
@@ -554,11 +583,12 @@ class App(tk.Tk):
         self.model_var = tk.StringVar(value="rife-v4.6")
         self.gpu_var = tk.StringVar()
         self.verbose_var = tk.BooleanVar()
+        self.cutout_var = tk.BooleanVar()
         self.advanced_open = False
 
         self.build()
         self.refresh_tools()
-        self.format_var.trace_add("write", lambda *_: self.update_fps_hint())
+        self.format_var.trace_add("write", lambda *_: (self.update_fps_hint(), self.update_cutout_hint()))
         self.update_fps_hint()
         self.after(100, self.drain_log)
 
@@ -638,7 +668,7 @@ class App(tk.Tk):
         # Trim
         trim_card, trim = self.card(left, "Preview & trim")
         trim_card.grid(row=1, column=0, sticky="nsew", pady=(14, 0))
-        self.trim = TrimPanel(trim, self.start_var, self.duration_var)
+        self.trim = TrimPanel(trim, self.start_var, self.duration_var, self.cutout_var)
         self.trim.pack(fill="both", expand=True)
 
         # Settings
@@ -669,9 +699,18 @@ class App(tk.Tk):
         self.fps_hint.grid(row=3, column=0, columnspan=4, sticky="w", pady=(4, 0))
 
         self.adv_btn = ttk.Button(opts, text="▸  Advanced", style="Link.TButton", command=self.toggle_advanced)
-        self.adv_btn.grid(row=4, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        cut = ttk.Frame(opts, style="Card.TFrame")
+        cut.grid(row=4, column=0, columnspan=4, sticky="ew", pady=(12, 0))
+        self.cutout_check = ttk.Checkbutton(cut, text="Remove background (AI)", variable=self.cutout_var,
+                                            style="Card.TCheckbutton")
+        self.cutout_check.pack(anchor="w")
+        self.cutout_hint = ttk.Label(cut, style="Hint.TLabel", wraplength=px(460))
+        self.cutout_hint.pack(anchor="w", pady=(4, 0))
+        self.cutout_var.trace_add("write", lambda *_: self.update_cutout_hint())
+
+        self.adv_btn.grid(row=5, column=0, columnspan=2, sticky="w", pady=(10, 0))
         self.adv = ttk.Frame(opts, style="Card.TFrame")
-        self.adv.grid(row=5, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        self.adv.grid(row=6, column=0, columnspan=4, sticky="ew", pady=(8, 0))
         for c in range(4):
             self.adv.columnconfigure(c, weight=1, uniform="adv")
         self.field(self.adv, "Engine",
@@ -696,8 +735,13 @@ class App(tk.Tk):
         self.ffmpeg_pill.pack(side="left")
         self.rife_pill = self.pill(status)
         self.rife_pill.pack(side="left", padx=(16, 0))
+        self.cutout_pill = self.pill(status)
+        self.cutout_pill.pack(side="left", padx=(16, 0))
         self.install_btn = ttk.Button(status, text="Install RIFE", style="Small.TButton", command=self.install_rife)
         self.install_btn.pack(side="right")
+        self.cutout_btn = ttk.Button(status, text="Install AI cutout", style="Small.TButton",
+                                     command=self.install_cutout)
+        self.cutout_btn.pack(side="right", padx=(0, 8))
 
         # Actions
         actions = ttk.Frame(main)
@@ -777,9 +821,40 @@ class App(tk.Tk):
             self.install_btn.pack_forget()
         elif not self.install_btn.winfo_ismapped():
             self.install_btn.pack(side="right")
+        self.cutout_ok, cut_msg = matting.status()
+        self.cutout_msg = cut_msg
+        self.cutout_needs_model = not self.cutout_ok and not matting.MODEL.is_file()
+        # The button can download the model; missing Python packages need pip instead.
+        if self.cutout_needs_model and "onnxruntime" not in cut_msg:
+            if not self.cutout_btn.winfo_ismapped():
+                self.cutout_btn.pack(side="right", padx=(0, 8))
+        else:
+            self.cutout_btn.pack_forget()
+        self.cutout_check.config(state="normal" if self.cutout_ok else "disabled")
+        if not self.cutout_ok:
+            self.cutout_var.set(False)
+        self.set_pill(self.cutout_pill, self.cutout_ok, cut_msg if self.cutout_ok else "AI cutout not installed",
+                      None if self.cutout_ok else WARN)
+        self.update_cutout_hint()
         self.set_pill(self.ffmpeg_pill, ffmpeg, "FFmpeg ready" if ffmpeg else "FFmpeg not found — install it and add to PATH")
         self.set_pill(self.rife_pill, rife, "RIFE AI interpolation" if rife else "RIFE not installed (FFmpeg fallback)",
                       None if rife else WARN)
+
+    def update_cutout_hint(self):
+        if not hasattr(self, "cutout_ok"):
+            return
+        if not self.cutout_ok:
+            text = ("Needs numpy and onnxruntime: pip install -r requirements.txt"
+                    if "onnxruntime" in self.cutout_msg else "Click Install AI cutout below to download the model (15 MB).")
+        elif not self.cutout_var.get():
+            text = "Cuts out the person or character with RobustVideoMatting. Preview shows the result."
+        else:
+            text = {"gif": "GIF transparency is on/off per pixel, so edges look harder than in WebP/APNG.",
+                    "webp": "WebP keeps smooth, semi-transparent edges.",
+                    "apng": "APNG keeps smooth edges, but files are large.",
+                    "mp4": "MP4 can't be transparent, so the background becomes black.",
+                    "all": "Transparent in GIF, WebP and APNG; MP4 gets a black background."}[self.format_var.get()]
+        self.cutout_hint.config(text=text)
 
     def update_fps_hint(self):
         fmt = self.format_var.get()
@@ -902,6 +977,8 @@ class App(tk.Tk):
             cmd += ["--rife-model", self.model_var.get().strip()]
         if self.gpu_var.get().strip():
             cmd += ["--gpu", self.gpu_var.get().strip()]
+        if self.cutout_var.get():
+            cmd.append("--remove-bg")
         if self.verbose_var.get():
             cmd.append("-v")
         return cmd
@@ -912,6 +989,7 @@ class App(tk.Tk):
         self.outputs = []
         self.convert_btn.config(state="disabled", text="Converting…" if label == "Converting" else "Convert")
         self.install_btn.config(state="disabled")
+        self.cutout_btn.config(state="disabled")
         self.cancel_btn.config(state="normal")
         self.open_btn.config(state="disabled")
         self.folder_btn.config(state="disabled")
@@ -950,6 +1028,7 @@ class App(tk.Tk):
                                 fg=WARN if cancelled else GOOD if code == 0 else BAD)
         self.convert_btn.config(state="normal", text="Convert")
         self.install_btn.config(state="normal")
+        self.cutout_btn.config(state="normal")
         self.cancel_btn.config(state="disabled")
         self.refresh_tools()
 
@@ -978,6 +1057,9 @@ class App(tk.Tk):
 
     def install_rife(self):
         self.start(child_cmd("setup"), "Installing RIFE")
+
+    def install_cutout(self):
+        self.start([*child_cmd("setup"), "--matting"], "Installing AI cutout")
 
     def cancel(self):
         if not self.proc:
