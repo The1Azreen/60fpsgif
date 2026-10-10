@@ -38,7 +38,20 @@ python setup_tools.py
 
 This downloads [rife-ncnn-vulkan](https://github.com/nihui/rife-ncnn-vulkan) into `tools/`. It runs on any Vulkan-capable GPU (NVIDIA / AMD / Intel). Without it, the tool falls back to FFmpeg's `minterpolate` (CPU, more artifacts).
 
-## Usage
+## Desktop app
+
+Prefer clicking to typing? Double-click **`fpsgif_gui.pyw`** (or run `python fpsgif_gui.pyw`). Pick a video, choose the format, fps, width and trim, then hit **Convert**. Progress streams into the log, and **Open result** / **Show in folder** take you to the file. If RIFE isn't installed yet, the app shows an **Install RIFE** button. It uses only Python's built-in tkinter, so nothing extra needs installing.
+
+### Build a standalone .exe
+
+```
+pip install pyinstaller
+python build_exe.py
+```
+
+This creates `dist/60fps GIF Maker.exe`, a single file you can put anywhere (desktop, Start menu, another PC) and double-click, with no Python needed. FFmpeg still has to be on PATH. RIFE is looked for in a `tools/` folder next to the exe, so either copy `tools/` over or click **Install RIFE** in the app.
+
+## Command line
 
 ```
 python fpsgif.py clip.mp4                      # -> clip_50fps.gif

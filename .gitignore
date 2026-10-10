@@ -6,3 +6,6 @@ __pycache__/
 test_*.mp4
 output/
 !examples/**
+build/
+dist/
+*.spec

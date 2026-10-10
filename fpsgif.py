@@ -21,7 +21,8 @@ import sys
 import tempfile
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent
+# When packaged as an .exe, keep tools/ next to the exe rather than in the temp unpack dir.
+ROOT = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
 TOOLS = ROOT / "tools"
 
 GIF_MAX_FPS = 50

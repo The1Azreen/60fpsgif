@@ -10,7 +10,9 @@ VERSION = "20221029"
 PLATFORM = {"win32": "windows", "darwin": "macos"}.get(sys.platform, "ubuntu")
 URL = (f"https://github.com/nihui/rife-ncnn-vulkan/releases/download/"
        f"{VERSION}/rife-ncnn-vulkan-{VERSION}-{PLATFORM}.zip")
-TOOLS = Path(__file__).resolve().parent / "tools"
+# When packaged as an .exe, keep tools/ next to the exe rather than in the temp unpack dir.
+ROOT = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
+TOOLS = ROOT / "tools"
 
 
 def main():
