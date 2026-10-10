@@ -1,4 +1,4 @@
-# 60fpsgif-
+# 60fpsgif or try to anyways
 
 Turn a short video into a buttery-smooth, high-frame-rate GIF (or WebP / APNG / MP4) using AI frame interpolation.
 
