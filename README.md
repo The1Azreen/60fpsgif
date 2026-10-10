@@ -4,7 +4,7 @@ Turn a short video into a buttery-smooth, high-frame-rate GIF (or WebP / APNG / 
 
 ## Examples
 
-**Before → after.** A 4 s clip dropped to a choppy 15 fps, then rebuilt to 50 fps by RIFE (140 of the 200 frames are AI-generated):
+**Before → after.** A 4 s clip (Fortnite in case your wondering) dropped to a choppy 15 fps, then rebuilt to 50 fps by RIFE (140 of the 200 frames are AI-generated):
 
 | Before: 15 fps (2.5 MB) | After: 50 fps with RIFE (8.1 MB) |
 |---|---|
