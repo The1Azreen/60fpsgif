@@ -5,7 +5,9 @@ options, and convert without touching the command line. The conversion runs
 fpsgif.py in a subprocess and streams its output into the log pane.
 """
 
+import base64
 import ctypes
+import math
 import os
 import queue
 import re
@@ -181,7 +183,7 @@ class DropZone(tk.Canvas):
     """Big clickable area for choosing the input video."""
 
     def __init__(self, parent, command):
-        super().__init__(parent, height=px(108), bg=CARD, highlightthickness=0, cursor="hand2")
+        super().__init__(parent, height=px(84), bg=CARD, highlightthickness=0, cursor="hand2")
         self.command = command
         self.title, self.subtitle = "Choose a video", "Click to browse  ·  MP4, MOV, MKV, WebM, AVI…"
         self.has_file = False
@@ -219,6 +221,308 @@ class DropZone(tk.Canvas):
         self.create_text(x, cy + px(3), text=self.subtitle, anchor="nw", fill=MUTED, font=(UI, 9), width=wrap)
 
 
+def fmt_time(t):
+    m, s = divmod(max(t, 0), 60)
+    return f"{int(m)}:{s:05.2f}"
+
+
+class FrameSource:
+    """Grabs preview frames and filmstrips with FFmpeg on a background thread.
+
+    Only the newest request of each kind is kept, so scrubbing never queues up stale frames.
+    Results land in .results as (kind, args, base64 PNG or None) for the Tk thread to pick up.
+    """
+
+    def __init__(self):
+        self.cv = threading.Condition()
+        self.pending = {}
+        self.results = queue.Queue()
+        threading.Thread(target=self.loop, daemon=True).start()
+
+    def request(self, kind, *args):
+        with self.cv:
+            self.pending[kind] = args
+            self.cv.notify()
+
+    def loop(self):
+        while True:
+            with self.cv:
+                while not self.pending:
+                    self.cv.wait()
+                kind = "frame" if "frame" in self.pending else next(iter(self.pending))
+                args = self.pending.pop(kind)
+            self.results.put((kind, args, self.grab(kind, *args)))
+
+    @staticmethod
+    def grab(kind, path, *rest):
+        if kind == "frame":
+            t, w, h = rest
+            pre, vf = ["-ss", f"{t:.3f}"], f"scale={w}:{h}:force_original_aspect_ratio=decrease"
+        else:  # filmstrip from keyframes only: fast even for long videos
+            duration, n, tw, th = rest
+            pre = ["-skip_frame", "nokey"]
+            vf = (f"fps={n}/{duration:.3f},scale={tw}:{th}:force_original_aspect_ratio=increase,"
+                  f"crop={tw}:{th},tile={n}x1")
+        cmd = [fpsgif.find_exe("ffmpeg"), "-hide_banner", "-loglevel", "error", *pre, "-i", path, "-an",
+               "-vf", vf, "-frames:v", "1", "-f", "image2pipe", "-c:v", "png", "-"]
+        try:
+            out = subprocess.run(cmd, capture_output=True, timeout=30, creationflags=NO_WINDOW).stdout
+        except Exception:
+            out = b""
+        return base64.b64encode(out).decode() if out else None
+
+
+class TrimPanel(ttk.Frame):
+    """Frame preview plus a timeline with draggable start/end handles, synced to the trim fields."""
+
+    STRIP_H = 44
+
+    def __init__(self, parent, start_var, duration_var):
+        super().__init__(parent, style="Card.TFrame")
+        self.start_var, self.duration_var = start_var, duration_var
+        self.path, self.duration, self.fps = None, 0.0, 30.0
+        self.start = self.end = self.head = 0.0
+        self.drag = None
+        self.syncing = False
+        self.frame_img = self.strip_img = None
+        self.strip_key = None
+        self.jobs = {}
+        self.frames = FrameSource()
+
+        self.preview = tk.Canvas(self, bg=FIELD, height=px(180), highlightthickness=1, highlightbackground=BORDER)
+        self.preview.pack(fill="both", expand=True)
+        self.timeline = tk.Canvas(self, bg=CARD, height=px(self.STRIP_H + 16), highlightthickness=0,
+                                  cursor="hand2", takefocus=1)
+        self.timeline.pack(fill="x", pady=(px(10), 0))
+
+        bar = ttk.Frame(self, style="Card.TFrame")
+        bar.pack(fill="x", pady=(px(8), 0))
+        ttk.Button(bar, text="Set start", style="Card.TButton", command=lambda: self.set_edge("start")).pack(side="left")
+        ttk.Button(bar, text="Set end", style="Card.TButton", command=lambda: self.set_edge("end")).pack(
+            side="left", padx=(px(8), 0))
+        ttk.Button(bar, text="Whole video", style="Card.TButton", command=self.reset).pack(side="left", padx=(px(8), 0))
+        self.range_label = tk.Label(bar, bg=CARD, fg=TEXT, font=(UI, 10))
+        self.range_label.pack(side="right")
+        ttk.Label(self, text="Drag the purple handles to trim  ·  click to scrub  ·  ← / → one frame (Shift: 1 s)",
+                  style="Hint.TLabel").pack(anchor="w", pady=(px(6), 0))
+
+        self.preview.bind("<Configure>", lambda e: (self.draw_preview(), self.debounce("frame", 150, self.request_frame)))
+        self.timeline.bind("<Configure>", lambda e: (self.draw(), self.debounce("strip", 300, self.request_strip)))
+        self.timeline.bind("<ButtonPress-1>", self.press)
+        self.timeline.bind("<B1-Motion>", self.motion)
+        self.timeline.bind("<ButtonRelease-1>", lambda e: setattr(self, "drag", None))
+        for key, step in (("<Left>", -1), ("<Right>", 1)):
+            self.timeline.bind(key, lambda e, s=step: self.step(s / self.fps))
+            self.timeline.bind(f"<Shift-{key[1:]}", lambda e, s=step: self.step(s))
+        for var in (start_var, duration_var):
+            var.trace_add("write", lambda *_: self.from_fields())
+        self.after(30, self.poll)
+
+    # ----- data -----
+
+    def load(self, path, info):
+        self.path, self.duration = path, info["duration"]
+        self.fps = info["fps"] or 30.0
+        self.start, self.end, self.head = 0.0, self.duration, 0.0
+        self.frame_img = self.strip_img = None
+        self.strip_key = None
+        self.from_fields()  # keep any trim already typed in
+        self.head = self.start
+        self.draw()
+        self.draw_preview()
+        self.request_strip()
+        self.request_frame()
+
+    def debounce(self, name, ms, fn):
+        if name in self.jobs:
+            self.after_cancel(self.jobs[name])
+        self.jobs[name] = self.after(ms, fn)
+
+    def request_frame(self):
+        if not self.path:
+            return
+        w, h = self.preview.winfo_width() - 2, self.preview.winfo_height() - 2
+        if w > 10 and h > 10:
+            t = min(self.head, max(self.duration - 1.5 / self.fps, 0))  # seeking past the last frame yields nothing
+            self.frames.request("frame", self.path, round(t, 3), w, h)
+
+    def request_strip(self):
+        if not self.path:
+            return
+        x0, x1 = self.track()
+        th = px(self.STRIP_H)
+        tw = round(th * 16 / 9)
+        n = max(1, math.ceil((x1 - x0) / tw))
+        key = (self.path, n, tw, th)
+        if key != self.strip_key:
+            self.strip_key = key
+            self.frames.request("strip", self.path, self.duration, n, tw, th)
+
+    def poll(self):
+        try:
+            while True:
+                kind, args, data = self.frames.results.get_nowait()
+                if args[0] != self.path:
+                    continue
+                img = tk.PhotoImage(data=data) if data else None
+                if kind == "frame":
+                    self.frame_img = img
+                    self.draw_preview()
+                else:
+                    x0, x1 = self.track()
+                    if img and img.width() > x1 - x0:  # crop the strip to the track width
+                        crop = tk.PhotoImage()
+                        crop.tk.call(crop, "copy", img, "-from", 0, 0, x1 - x0, img.height())
+                        img = crop
+                    self.strip_img = img
+                    self.draw()
+        except queue.Empty:
+            pass
+        self.after(30, self.poll)
+
+    # ----- trim fields <-> handles -----
+
+    def min_len(self):
+        return min(2 / self.fps, self.duration)
+
+    def to_fields(self):
+        self.syncing = True
+        self.start_var.set("" if self.start < 0.005 else f"{self.start:.2f}")
+        self.duration_var.set("" if self.end > self.duration - 0.005 else f"{self.end - self.start:.2f}")
+        self.syncing = False
+        self.update_label()
+
+    def from_fields(self):
+        if self.syncing or not self.duration:
+            return
+        try:
+            s = fpsgif.parse_time(self.start_var.get().strip()) if self.start_var.get().strip() else 0.0
+            d = float(self.duration_var.get()) if self.duration_var.get().strip() else None
+        except ValueError:
+            return  # half-typed value; wait for the next keystroke
+        self.start = min(max(s, 0.0), max(self.duration - self.min_len(), 0.0))
+        self.end = self.duration if d is None else min(max(self.start + d, self.start + self.min_len()), self.duration)
+        self.draw()
+
+    def update_label(self):
+        if self.duration:
+            self.range_label.config(text=f"{fmt_time(self.start)}  →  {fmt_time(self.end)}    "
+                                         f"{self.end - self.start:.2f} s")
+
+    def set_edge(self, edge):
+        if not self.duration:
+            return
+        if edge == "start":
+            self.start = min(self.head, self.end - self.min_len())
+        else:
+            self.end = max(self.head, self.start + self.min_len())
+        self.to_fields()
+        self.draw()
+
+    def reset(self):
+        if self.duration:
+            self.start, self.end = 0.0, self.duration
+            self.to_fields()
+            self.draw()
+
+    # ----- timeline interaction -----
+
+    def track(self):
+        pad = px(10)
+        return pad, max(self.timeline.winfo_width() - pad, pad + 1)
+
+    def t2x(self, t):
+        x0, x1 = self.track()
+        return x0 + (x1 - x0) * (t / self.duration if self.duration else 0)
+
+    def x2t(self, x):
+        x0, x1 = self.track()
+        return min(max((x - x0) / (x1 - x0), 0), 1) * self.duration
+
+    def press(self, e):
+        self.timeline.focus_set()
+        if not self.duration:
+            return
+        hw = px(8)
+        ds, de = abs(e.x - (self.t2x(self.start) - hw / 2)), abs(e.x - (self.t2x(self.end) + hw / 2))
+        if min(ds, de) <= px(10):
+            self.drag = "start" if ds <= de else "end"
+        else:
+            self.drag = "head"
+        self.motion(e)
+
+    def motion(self, e):
+        if not self.duration or not self.drag:
+            return
+        t = self.x2t(e.x)
+        if self.drag == "start":
+            self.start = self.head = min(t, self.end - self.min_len())
+        elif self.drag == "end":
+            self.end = self.head = max(t, self.start + self.min_len())
+        else:
+            self.head = t
+        if self.drag != "head":
+            self.to_fields()
+        self.draw()
+        self.draw_preview()
+        self.request_frame()
+
+    def step(self, delta):
+        if self.duration:
+            self.head = min(max(self.head + delta, 0), self.duration)
+            self.draw()
+            self.draw_preview()
+            self.request_frame()
+
+    # ----- drawing -----
+
+    def draw(self):
+        c = self.timeline
+        c.delete("all")
+        x0, x1 = self.track()
+        y0, y1 = px(8), px(8 + self.STRIP_H)
+        c.create_rectangle(x0, y0, x1, y1, fill=FIELD, outline=BORDER)
+        if not self.duration:
+            c.create_text((x0 + x1) / 2, (y0 + y1) / 2, text="Timeline appears once a video is chosen",
+                          fill=FAINT, font=(UI, 9))
+            return
+        if self.strip_img:
+            c.create_image(x0, y0, image=self.strip_img, anchor="nw")
+        sx, ex = self.t2x(self.start), self.t2x(self.end)
+        for a, b in ((x0, sx), (ex, x1)):  # dim what's outside the selection
+            if b > a:
+                c.create_rectangle(a, y0, b, y1, fill="black", stipple="gray75", outline="")
+        c.create_rectangle(sx, y0, ex, y1, outline=ACCENT, width=px(2))
+        hw = px(8)
+        for a, b in ((sx - hw, sx), (ex, ex + hw)):
+            c.create_rectangle(a, y0 - px(2), b, y1 + px(2), fill=ACCENT, outline="")
+            mid = (a + b) / 2
+            c.create_line(mid, y0 + px(14), mid, y1 - px(14), fill="white", width=max(1, px(1)))
+        hx = self.t2x(self.head)
+        c.create_line(hx, y0 - px(4), hx, y1 + px(4), fill="white", width=px(2))
+        c.create_polygon(hx - px(5), y0 - px(8), hx + px(5), y0 - px(8), hx, y0 - px(2), fill="white", outline="")
+        self.update_label()
+
+    def draw_preview(self):
+        c = self.preview
+        c.delete("all")
+        w, h = c.winfo_width(), c.winfo_height()
+        if not self.path:
+            c.create_text(w / 2, h / 2, text="Choose a video to preview and trim it", fill=FAINT, font=(UI, 11))
+            return
+        if self.frame_img:
+            c.create_image(w / 2, h / 2, image=self.frame_img)
+        else:
+            c.create_text(w / 2, h / 2, text="Loading preview…", fill=MUTED, font=(UI, 10))
+        if self.duration:
+            text = c.create_text(px(14), h - px(12), anchor="sw", fill="white", font=(UI, 10, "bold"),
+                                 text=f"{fmt_time(self.head)} / {fmt_time(self.duration)}")
+            bx0, by0, bx1, by1 = c.bbox(text)
+            bg = c.create_rectangle(bx0 - px(8), by0 - px(4), bx1 + px(8), by1 + px(4), fill="#000000",
+                                    stipple="gray50", outline="")
+            c.tag_lower(bg, text)
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -228,8 +532,9 @@ class App(tk.Tk):
         self.configure(bg=BG)
         if sys.platform == "win32" and ICON.is_file():
             self.iconbitmap(default=str(ICON))
-        self.geometry(f"{px(760)}x{px(880)}")
-        self.minsize(px(680), px(720))
+        w, h = min(px(1240), self.winfo_screenwidth() - px(40)), min(px(860), self.winfo_screenheight() - px(80))
+        self.geometry(f"{w}x{h}+{max((self.winfo_screenwidth() - w) // 2, 0)}+{max((self.winfo_screenheight() - h) // 3, 0)}")
+        self.minsize(min(px(1000), w), min(px(700), h))
         setup_style(self)
         self.dark_title_bar()
 
@@ -293,20 +598,31 @@ class App(tk.Tk):
         return widget
 
     def build(self):
-        main = ttk.Frame(self, padding=(px(22), px(18)))
-        main.pack(fill="both", expand=True)
-        main.columnconfigure(0, weight=1)
+        root = ttk.Frame(self, padding=(px(22), px(18)))
+        root.pack(fill="both", expand=True)
+        root.columnconfigure(0, weight=11, uniform="cols")
+        root.columnconfigure(1, weight=9, uniform="cols")
+        root.rowconfigure(1, weight=1)
 
         # Header
-        header = ttk.Frame(main)
-        header.grid(row=0, column=0, sticky="ew", pady=(0, 14))
+        header = ttk.Frame(root)
+        header.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 14))
         ttk.Label(header, text="60fps GIF Maker", style="Title.TLabel").pack(anchor="w")
         ttk.Label(header, text="Turn short clips into buttery-smooth GIF, WebP, APNG or MP4 "
                                "with AI frame interpolation.", style="Subtitle.TLabel").pack(anchor="w")
 
+        # Left column: source + trim. Right column: settings, actions, output.
+        left = ttk.Frame(root)
+        left.grid(row=1, column=0, sticky="nsew", padx=(0, px(8)))
+        left.columnconfigure(0, weight=1)
+        left.rowconfigure(1, weight=1)
+        main = ttk.Frame(root)
+        main.grid(row=1, column=1, sticky="nsew", padx=(px(8), 0))
+        main.columnconfigure(0, weight=1)
+
         # Source
-        src_card, src = self.card(main, "Source")
-        src_card.grid(row=1, column=0, sticky="ew")
+        src_card, src = self.card(left, "Source")
+        src_card.grid(row=0, column=0, sticky="ew")
         self.drop = DropZone(src, self.pick_input)
         self.drop.pack(fill="x")
         save = ttk.Frame(src, style="Card.TFrame")
@@ -319,9 +635,15 @@ class App(tk.Tk):
         ttk.Label(save, text="Leave blank to save next to the input video.", style="Hint.TLabel").grid(
             row=2, column=0, sticky="w", pady=(4, 0))
 
+        # Trim
+        trim_card, trim = self.card(left, "Preview & trim")
+        trim_card.grid(row=1, column=0, sticky="nsew", pady=(14, 0))
+        self.trim = TrimPanel(trim, self.start_var, self.duration_var)
+        self.trim.pack(fill="both", expand=True)
+
         # Settings
         set_card, opts = self.card(main, "Settings")
-        set_card.grid(row=2, column=0, sticky="ew", pady=(14, 0))
+        set_card.grid(row=0, column=0, sticky="ew")
         for c in range(4):
             opts.columnconfigure(c, weight=1, uniform="opts")
 
@@ -343,7 +665,7 @@ class App(tk.Tk):
                    lambda p: ttk.Entry(p, textvariable=self.start_var, width=8), 2, 2)
         self.field(opts, "Duration (s)",
                    lambda p: ttk.Entry(p, textvariable=self.duration_var, width=8), 2, 3)
-        self.fps_hint = ttk.Label(opts, style="Hint.TLabel", wraplength=px(640))
+        self.fps_hint = ttk.Label(opts, style="Hint.TLabel", wraplength=px(460))
         self.fps_hint.grid(row=3, column=0, columnspan=4, sticky="w", pady=(4, 0))
 
         self.adv_btn = ttk.Button(opts, text="▸  Advanced", style="Link.TButton", command=self.toggle_advanced)
@@ -363,13 +685,13 @@ class App(tk.Tk):
         ttk.Checkbutton(chk, text="Verbose log", variable=self.verbose_var,
                         style="Card.TCheckbutton").pack(anchor="w")
         ttk.Label(self.adv, text="Start accepts seconds or hh:mm:ss.  GPU id: blank = default, -1 = CPU.  "
-                                 "Try rife-anime for cartoons.", style="Hint.TLabel", wraplength=px(640)).grid(
+                                 "Try rife-anime for cartoons.", style="Hint.TLabel", wraplength=px(460)).grid(
             row=1, column=0, columnspan=4, sticky="w", pady=(4, 0))
         self.adv.grid_remove()
 
         # Tools status
         status = ttk.Frame(main)
-        status.grid(row=3, column=0, sticky="ew", pady=(12, 0))
+        status.grid(row=1, column=0, sticky="ew", pady=(12, 0))
         self.ffmpeg_pill = self.pill(status)
         self.ffmpeg_pill.pack(side="left")
         self.rife_pill = self.pill(status)
@@ -379,7 +701,7 @@ class App(tk.Tk):
 
         # Actions
         actions = ttk.Frame(main)
-        actions.grid(row=4, column=0, sticky="ew", pady=(14, 0))
+        actions.grid(row=2, column=0, sticky="ew", pady=(14, 0))
         self.convert_btn = ttk.Button(actions, text="Convert", style="Accent.TButton", command=self.convert)
         self.convert_btn.pack(side="left")
         self.cancel_btn = ttk.Button(actions, text="Cancel", command=self.cancel, state="disabled")
@@ -391,8 +713,8 @@ class App(tk.Tk):
 
         # Log
         log_card, log = self.card(main, "Output", right=lambda p: self.make_state_label(p))
-        log_card.grid(row=5, column=0, sticky="nsew", pady=(14, 0))
-        main.rowconfigure(5, weight=1)
+        log_card.grid(row=3, column=0, sticky="nsew", pady=(14, 0))
+        main.rowconfigure(3, weight=1)
         prog = ttk.Frame(log, style="Card.TFrame")
         prog.pack(fill="x", pady=(0, 6))
         self.stage_label = tk.Label(prog, text="Waiting to start", bg=CARD, fg=MUTED, font=(UI, 10), anchor="w")
@@ -536,6 +858,7 @@ class App(tk.Tk):
                 info = fpsgif.probe(ffprobe, path)
                 text = (f"{info['width']} × {info['height']}   ·   {info['fps']:.2f} fps   ·   "
                         f"{info['duration']:.2f} s      Click to change")
+                self.after(0, self.trim.load, path, info)
             except (SystemExit, Exception):
                 text = "Could not read video info (is FFmpeg installed?)"
             self.after(0, self.drop.set_text, name, text)

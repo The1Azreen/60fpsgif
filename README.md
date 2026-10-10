@@ -40,7 +40,9 @@ This downloads [rife-ncnn-vulkan](https://github.com/nihui/rife-ncnn-vulkan) int
 
 ## Desktop app
 
-Prefer clicking to typing? Double-click **`fpsgif_gui.pyw`** (or run `python fpsgif_gui.pyw`). Pick a video, choose the format, fps, width and trim, then hit **Convert**. Progress streams into the log, and **Open result** / **Show in folder** take you to the file. If RIFE isn't installed yet, the app shows an **Install RIFE** button. It uses only Python's built-in tkinter, so nothing extra needs installing.
+![60fps GIF Maker desktop app](readme_image/app.png)
+
+Prefer clicking to typing? Double-click **`fpsgif_gui.pyw`** (or run `python fpsgif_gui.pyw`). Pick a video, scrub through it in the **Preview & trim** panel and drag the handles to select the part you want, choose the format, fps and width, then hit **Convert**. Progress streams into the log, and **Open result** / **Show in folder** take you to the file. If RIFE isn't installed yet, the app shows an **Install RIFE** button. It uses only Python's built-in tkinter, so nothing extra needs installing.
 
 ### Build a standalone .exe
 
