@@ -169,7 +169,7 @@ def setup_style(root):
               indicatorbackground=[("selected", ACCENT), ("active", BORDER)])
 
     style.configure("Accent.Horizontal.TProgressbar", troughcolor=CARD, background=ACCENT,
-                    bordercolor=CARD, lightcolor=ACCENT, darkcolor=ACCENT, thickness=px(4))
+                    bordercolor=CARD, lightcolor=ACCENT, darkcolor=ACCENT, thickness=px(8))
 
     style.layout("Dark.Vertical.TScrollbar", [("Vertical.Scrollbar.trough", {"sticky": "ns", "children": [
         ("Vertical.Scrollbar.thumb", {"expand": "1", "sticky": "nswe"})]})])
@@ -393,8 +393,14 @@ class App(tk.Tk):
         log_card, log = self.card(main, "Output", right=lambda p: self.make_state_label(p))
         log_card.grid(row=5, column=0, sticky="nsew", pady=(14, 0))
         main.rowconfigure(5, weight=1)
+        prog = ttk.Frame(log, style="Card.TFrame")
+        prog.pack(fill="x", pady=(0, 6))
+        self.stage_label = tk.Label(prog, text="Waiting to start", bg=CARD, fg=MUTED, font=(UI, 10), anchor="w")
+        self.stage_label.pack(side="left", fill="x", expand=True)
+        self.pct_label = tk.Label(prog, text="", bg=CARD, fg=ACCENT_HOVER, font=(UI, 11, "bold"))
+        self.pct_label.pack(side="right")
         self.progress = ttk.Progressbar(log, mode="determinate", style="Accent.Horizontal.TProgressbar")
-        self.progress.pack(fill="x", pady=(0, 10))
+        self.progress.pack(fill="x", pady=(0, 12))
         wrap = tk.Frame(log, bg=FIELD, highlightthickness=1, highlightbackground=BORDER)
         wrap.pack(fill="both", expand=True)
         self.log = tk.Text(wrap, height=8, bg=FIELD, fg=MUTED, font=(MONO, 9), relief="flat", bd=0,
@@ -481,16 +487,31 @@ class App(tk.Tk):
                 if item is None:
                     self.finished()
                     continue
+                if item.startswith(("@@progress ", "@@busy ")):
+                    kind, pct, label = item.rstrip().split(" ", 2)
+                    self.show_progress(float(pct), label, busy=kind == "@@busy")
+                    continue
                 self.write_log(item)
                 m = re.search(r"\] -> (.+)$", item.rstrip())
                 if m:
                     self.outputs.append(m.group(1))
-                    self.set_state("Encoding " + Path(m.group(1)).suffix.lstrip(".").upper() + "…", ACCENT_HOVER)
-                elif "RIFE:" in item:
-                    self.set_state("Interpolating frames with RIFE…", ACCENT_HOVER)
         except queue.Empty:
             pass
         self.after(100, self.drain_log)
+
+    def show_progress(self, pct, label, busy=False):
+        mode = str(self.progress["mode"])
+        if busy and mode != "indeterminate":
+            self.progress.config(mode="indeterminate")
+            self.progress.start(10)
+        elif not busy:
+            if mode != "determinate":
+                self.progress.stop()
+                self.progress.config(mode="determinate")
+            self.progress.config(value=pct)
+        self.stage_label.config(text=label + "…", fg=TEXT)
+        self.pct_label.config(text=f"{pct:.0f}%")
+        self.title(f"{pct:.0f}% · 60fps GIF Maker")
 
     def pick_input(self):
         if self.proc:
@@ -545,7 +566,7 @@ class App(tk.Tk):
         if self.outdir_var.get().strip() and not Path(self.outdir_var.get().strip()).is_dir():
             raise ValueError("Output folder does not exist.")
 
-        cmd = [*child_cmd("cli"), str(inp), *self.output_arg(inp),
+        cmd = [*child_cmd("cli"), "--progress", str(inp), *self.output_arg(inp),
                "-f", self.format_var.get(), "--engine", self.engine_var.get(),
                "-w", self.width_var.get().strip() or "480"]
         if self.fps_var.get().strip():
@@ -573,6 +594,8 @@ class App(tk.Tk):
         self.folder_btn.config(state="disabled")
         self.progress.config(mode="indeterminate")
         self.progress.start(10)
+        self.stage_label.config(text="Starting…", fg=TEXT)
+        self.pct_label.config(text="")
         self.set_state(label + "…", ACCENT_HOVER)
         self.log.config(state="normal")
         self.log.delete("1.0", "end")
@@ -598,6 +621,10 @@ class App(tk.Tk):
         self.cancelled = False
         self.progress.stop()
         self.progress.config(mode="determinate", value=100 if code == 0 and not cancelled else 0)
+        self.title("60fps GIF Maker")
+        self.pct_label.config(text="100%" if code == 0 and not cancelled else "")
+        self.stage_label.config(text="Cancelled" if cancelled else "Finished" if code == 0 else "Failed - see log",
+                                fg=WARN if cancelled else GOOD if code == 0 else BAD)
         self.convert_btn.config(state="normal", text="Convert")
         self.install_btn.config(state="normal")
         self.cancel_btn.config(state="disabled")

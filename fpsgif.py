@@ -19,6 +19,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 from pathlib import Path
 
 # When packaged as an .exe, keep tools/ next to the exe rather than in the temp unpack dir.
@@ -28,6 +29,8 @@ TOOLS = ROOT / "tools"
 GIF_MAX_FPS = 50
 FORMATS = ("gif", "webp", "apng", "mp4")
 DEFAULT_FPS = {"gif": 50, "webp": 60, "apng": 60, "mp4": 60}
+# Keep FFmpeg/RIFE from popping up console windows when run from the windowed GUI.
+NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
 
 def find_exe(name):
@@ -38,19 +41,80 @@ def find_exe(name):
     return shutil.which(name)
 
 
-def run(cmd, quiet=True):
+def run(cmd, quiet=True, on_progress=None):
+    """Run a command, exiting on failure. For FFmpeg commands, on_progress(seconds) is
+    called with the output position as encoding advances."""
     print("  $ " + " ".join(f'"{c}"' if " " in str(c) else str(c) for c in cmd))
-    result = subprocess.run(
-        [str(c) for c in cmd],
-        stdout=subprocess.PIPE if quiet else None,
-        stderr=subprocess.PIPE if quiet else None,
-        text=True,
-    )
+    cmd = [str(c) for c in cmd]
+    if on_progress is None:
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE if quiet else None,
+            stderr=subprocess.PIPE if quiet else None,
+            text=True,
+            creationflags=NO_WINDOW,
+        )
+    else:
+        cmd = [cmd[0], "-nostats", "-progress", "pipe:1", *cmd[1:]]
+        with tempfile.TemporaryFile("w+", encoding="utf-8", errors="replace") as err:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=err if quiet else None,
+                                    text=True, creationflags=NO_WINDOW)
+            for line in proc.stdout:
+                key, _, value = line.strip().partition("=")
+                if key == "out_time_us" and value.isdigit():
+                    on_progress(int(value) / 1e6)
+            proc.wait()
+            err.seek(0)
+            result = subprocess.CompletedProcess(cmd, proc.returncode, "", err.read())
     if result.returncode != 0:
         if quiet:
             sys.stderr.write(result.stderr or "")
         sys.exit(f"Command failed: {cmd[0]}")
     return result
+
+
+class Progress:
+    """Prints "@@progress <percent> <label>" lines for the GUI (hidden --progress flag).
+
+    The run is split into equal jobs (one per output format); each job into stages.
+    """
+
+    def __init__(self, enabled, jobs):
+        self.enabled, self.jobs, self.job, self.last = enabled, jobs, 0, None
+
+    def stage(self, lo, hi, label, busy=False):
+        """Start a stage spanning [lo, hi] of the current job; return report(fraction, detail).
+
+        busy=True marks a stage whose progress can't be measured, so the GUI animates instead.
+        """
+        def report(frac, detail=""):
+            if not self.enabled:
+                return
+            pct = 100 * (self.job + lo + (hi - lo) * min(max(frac, 0), 1)) / self.jobs
+            kind = "busy" if busy and frac < 1 else "progress"
+            line = f"@@{kind} {pct:.1f} {label} {detail}".rstrip()
+            if line != self.last:
+                self.last = line
+                print(line, flush=True)
+        report(0)
+        return report
+
+
+def parse_time(value):
+    """Seconds from "3", "3.5", "01:02" or "00:01:02.5"."""
+    return sum(float(part) * 60 ** i for i, part in enumerate(reversed(str(value).split(":"))))
+
+
+def clip_seconds(args, info):
+    length = max(info["duration"] - (parse_time(args.start) if args.start else 0), 0)
+    if args.duration:
+        length = min(length, float(args.duration)) if length else float(args.duration)
+    return length
+
+
+def timed(report, seconds):
+    """Adapt a stage report to FFmpeg's position-in-seconds callback."""
+    return (lambda t: report(t / seconds)) if seconds else None
 
 
 def probe(ffprobe, path):
@@ -89,19 +153,20 @@ def scale_filter(width):
     return f"scale={width}:-2:flags=lanczos" if width else "null"
 
 
-def interpolate_rife(rife, ffmpeg, args, src_fps, target_fps, work):
+def interpolate_rife(rife, ffmpeg, args, src_fps, target_fps, work, progress, clip):
     """Extract frames, run RIFE to hit target_fps exactly, return (pattern, fps)."""
     src_dir = work / "src"
     out_dir = work / f"rife_{target_fps}"
     src_dir.mkdir(exist_ok=True)
     out_dir.mkdir(exist_ok=True)
 
+    report = progress.stage(0, 0.1, "Extracting frames")
     if not any(src_dir.iterdir()):
         run([
             ffmpeg, "-hide_banner", "-y", *trim_args(args), "-i", args.input,
             "-vf", scale_filter(args.width), "-fps_mode", "passthrough",
             str(src_dir / "%08d.png"),
-        ])
+        ], on_progress=timed(report, clip))
 
     n_in = len(list(src_dir.glob("*.png")))
     if n_in < 2:
@@ -111,10 +176,24 @@ def interpolate_rife(rife, ffmpeg, args, src_fps, target_fps, work):
     if len(list(out_dir.glob("*.png"))) != n_out:  # reuse frames across formats at the same fps
         model = Path(rife).parent / args.rife_model
         print(f"  RIFE: {n_in} frames @ {src_fps:.3f} fps -> {n_out} frames @ {target_fps} fps")
-        run([
-            rife, "-i", src_dir, "-o", out_dir, "-n", n_out,
-            "-m", model, "-f", "%08d.png", *(["-g", args.gpu] if args.gpu is not None else []),
-        ], quiet=not args.verbose)
+        report = progress.stage(0.1, 0.7, "Interpolating with RIFE")
+        done = threading.Event()
+
+        def watch():  # RIFE prints no progress, so count the frames it has written
+            while not done.wait(0.5):
+                n = sum(1 for _ in out_dir.glob("*.png"))
+                report(n / n_out, f"({n}/{n_out} frames)")
+
+        watcher = threading.Thread(target=watch, daemon=True)
+        watcher.start()
+        try:
+            run([
+                rife, "-i", src_dir, "-o", out_dir, "-n", n_out,
+                "-m", model, "-f", "%08d.png", *(["-g", args.gpu] if args.gpu is not None else []),
+            ], quiet=not args.verbose)
+        finally:
+            done.set()
+            watcher.join()
     return ["-framerate", str(target_fps), "-i", str(out_dir / "%08d.png")], "null"
 
 
@@ -127,7 +206,7 @@ def interpolate_ffmpeg(args, target_fps):
     return [*trim_args(args), "-i", args.input], vf
 
 
-def encode(ffmpeg, fmt, inputs, vf, fps, out):
+def encode(ffmpeg, fmt, inputs, vf, fps, out, on_progress=None):
     base = [ffmpeg, "-hide_banner", "-y", *inputs]
     if fmt == "gif":
         # Build one palette tuned to this clip, then dither against it.
@@ -136,16 +215,18 @@ def encode(ffmpeg, fmt, inputs, vf, fps, out):
             "[a]palettegen=max_colors=256:stats_mode=diff[p];"
             "[b][p]paletteuse=dither=sierra2_4a:diff_mode=rectangle"
         )
-        run([*base, "-filter_complex", graph, "-loop", "0", out])
+        run([*base, "-filter_complex", graph, "-loop", "0", out], on_progress=on_progress)
     elif fmt == "webp":
+        # compression_level 6 is ~25x slower than 4 for ~2% smaller files.
         run([*base, "-vf", f"{vf},fps={fps}", "-c:v", "libwebp_anim",
-             "-quality", "85", "-compression_level", "6", "-loop", "0", out])
+             "-quality", "85", "-compression_level", "4", "-loop", "0", out], on_progress=on_progress)
     elif fmt == "apng":
-        run([*base, "-vf", f"{vf},fps={fps}", "-c:v", "apng", "-plays", "0", "-f", "apng", out])
+        run([*base, "-vf", f"{vf},fps={fps}", "-c:v", "apng", "-plays", "0", "-f", "apng", out], on_progress=on_progress)
     elif fmt == "mp4":
         # Silent, web-friendly H.264 that plays inline like a GIF.
         run([*base, "-vf", f"{vf},fps={fps}", "-an", "-c:v", "libx264", "-preset", "slow",
-             "-crf", "23", "-pix_fmt", "yuv420p", "-movflags", "+faststart", out])
+             "-crf", "23", "-pix_fmt", "yuv420p", "-movflags", "+faststart", out],
+            on_progress=on_progress)
 
 
 def main():
@@ -164,6 +245,7 @@ def main():
     p.add_argument("--gpu", type=int, help="GPU id for RIFE (-1 = CPU)")
     p.add_argument("--keep-temp", action="store_true", help="keep extracted/interpolated frames")
     p.add_argument("-v", "--verbose", action="store_true")
+    p.add_argument("--progress", action="store_true", help=argparse.SUPPRESS)  # machine-readable, for the GUI
     args = p.parse_args()
 
     ffmpeg, ffprobe = find_exe("ffmpeg"), find_exe("ffprobe")
@@ -188,9 +270,11 @@ def main():
     print(f"Input: {inp.name}  {info['width']}x{info['height']}  {info['fps']:.3f} fps  "
           f"{info['duration']:.2f}s  | engine: {engine}")
 
+    clip = clip_seconds(args, info)
+    progress = Progress(args.progress, len(formats))
     work = Path(tempfile.mkdtemp(prefix="fpsgif_"))
     try:
-        for fmt in formats:
+        for progress.job, fmt in enumerate(formats):
             fps = args.fps or DEFAULT_FPS[fmt]
             if fmt == "gif" and fps > GIF_MAX_FPS:
                 print(f"  note: GIF can't play reliably above {GIF_MAX_FPS} fps; using {GIF_MAX_FPS}.")
@@ -204,15 +288,20 @@ def main():
                     .with_name(f"{(Path(args.output) if args.output else inp).stem}_{fps}fps{suffix}")
 
             print(f"\n[{fmt.upper()} @ {fps} fps] -> {out}")
+            interpolated = False
             if info["fps"] >= fps - 0.01:
                 print("  source already at/above target fps; resampling only")
                 inputs, vf = [*trim_args(args), "-i", str(inp)], scale_filter(args.width)
             elif engine == "rife":
-                inputs, vf = interpolate_rife(rife, ffmpeg, args, info["fps"], fps, work)
+                inputs, vf = interpolate_rife(rife, ffmpeg, args, info["fps"], fps, work, progress, clip)
+                interpolated = True
             else:
                 inputs, vf = interpolate_ffmpeg(args, fps)
 
-            encode(ffmpeg, fmt, inputs, vf, fps, out)
+            # libwebp_anim only emits output when it finishes, so FFmpeg reports no progress for it.
+            report = progress.stage(0.7 if interpolated else 0, 1, f"Encoding {fmt.upper()}", busy=fmt == "webp")
+            encode(ffmpeg, fmt, inputs, vf, fps, out, on_progress=timed(report, clip))
+            report(1)
             size = out.stat().st_size / 1024 / 1024
             print(f"  done: {size:.2f} MB")
     finally:
