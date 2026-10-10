@@ -6,9 +6,9 @@ Turn a short video into a buttery-smooth, high-frame-rate GIF (or WebP / APNG / 
 
 **Before → after.** A 4 s clip (Fortnite in case your wondering) dropped to a choppy 15 fps, then rebuilt to 50 fps by RIFE (140 of the 200 frames are AI-generated):
 
-| Before: 15 fps (2.5 MB) | After: 50 fps with RIFE (8.1 MB) |
-|---|---|
-| ![15 fps original](examples/before_15fps.gif) | ![50 fps interpolated](examples/after_50fps.gif) |
+![Before: 15 fps vs after: 50 fps with RIFE, side by side](examples/before_after.gif)
+
+Both halves are one GIF, so they always play in sync. The separate files are [before_15fps.gif](examples/before_15fps.gif) and [after_50fps.gif](examples/after_50fps.gif).
 
 ```
 python fpsgif.py clip_15fps.mp4 -w 360 -o examples/after_50fps.gif
