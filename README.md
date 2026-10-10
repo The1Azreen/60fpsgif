@@ -26,6 +26,21 @@ python fpsgif.py clip_15fps.mp4 -w 360 -o examples/after_50fps.gif
 python fpsgif.py video.mp4 -s 0 -t 4 -w 360 -o examples/demo.gif   # or .webp / .mp4
 ```
 
+## Background removal example
+
+The same clip with the background cut out by AI (see [Remove the background](#remove-the-background)). The original is on the left and the cutout on the right; the checkerboard marks the transparent areas:
+
+![Original vs background removed by AI, side by side](examples/background_removed.gif)
+
+| File | Format | FPS | Size |
+|---|---|---|---|
+| [background_removed.gif](examples/background_removed.gif) | GIF, side by side (above) | 50 | 8.2 MB |
+| [background_removed.webp](examples/background_removed.webp) | WebP, actually transparent | 50 | 2.0 MB |
+
+```
+python fpsgif.py video.mp4 -t 4 -w 320 --remove-bg -o cutout.webp
+```
+
 ## Requirements
 
 - Python 3.9+
@@ -85,7 +100,7 @@ python fpsgif.py clip.mp4 -s 3 -t 4 -w 360     # 4 s starting at 0:03, 360 px wi
 
 ## Remove the background
 
-`--remove-bg` (or **Remove background (AI)** in the app) cuts out the person or character and makes everything else transparent. The app previews the cutout on a checkerboard before you convert.
+`--remove-bg` (or **Remove background (AI)** in the app) cuts out the person or character and makes everything else transparent. The app previews the cutout on a checkerboard before you convert. See the [background removal example](#background-removal-example) for a demo.
 
 It uses [RobustVideoMatting](https://github.com/PeterL1n/RobustVideoMatting), a 15 MB video matting model run through onnxruntime. Unlike single-image cutout models it carries information from frame to frame, so the edges stay steady instead of flickering. It runs on the CPU at about 15 ms per 480 px frame, so a 10 s clip adds roughly 10 s. To use a GPU, install `onnxruntime-directml` (any DirectX 12 GPU on Windows) or `onnxruntime-gpu` (NVIDIA CUDA) instead of `onnxruntime`.
 
