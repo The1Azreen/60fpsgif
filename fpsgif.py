@@ -1,4 +1,4 @@
-"""Turn a short video into a smooth, high-frame-rate GIF (and/or WebP/APNG/MP4).
+"""Turn a short video into a smooth, high-frame-rate GIF (and/or WebP/APNG/MP4/AVIF).
 
 Pipeline:
   1. Trim + scale the input with FFmpeg.
@@ -6,10 +6,13 @@ Pipeline:
      RIFE (AI, best quality, needs a GPU with Vulkan) or FFmpeg's
      minterpolate filter (CPU fallback).
   3. Encode: GIF via a per-clip optimized palette, WebP/APNG directly, MP4 as
-     a silent H.264 "GIF video" (what Imgur serves as .gifv) - by far the smallest.
+     a silent H.264 "GIF video" (what Imgur serves as .gifv) - by far the smallest,
+     AVIF as animated AV1 (small, transparent, and the only format here that can stay HDR).
 
 GIF frame delays are stored in 1/100 s, and browsers slow down delays under
-20 ms, so GIF tops out at 50 fps. WebP, APNG and MP4 can do true 60 fps.
+20 ms, so GIF tops out at 50 fps. WebP, APNG, MP4 and AVIF can do true 60 fps.
+
+HDR sources (PQ or HLG) are tone-mapped to SDR, or with --hdr kept as a 10-bit HDR AVIF.
 """
 
 import argparse
@@ -28,8 +31,13 @@ ROOT = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__
 TOOLS = ROOT / "tools"
 
 GIF_MAX_FPS = 50
-FORMATS = ("gif", "webp", "apng", "mp4")
-DEFAULT_FPS = {"gif": 50, "webp": 60, "apng": 60, "mp4": 60}
+FORMATS = ("gif", "webp", "apng", "mp4", "avif")
+DEFAULT_FPS = {"gif": 50, "webp": 60, "apng": 60, "mp4": 60, "avif": 60}
+SUFFIX = {"gif": ".gif", "webp": ".webp", "apng": ".png", "mp4": ".mp4", "avif": ".avif"}
+HDR_TRANSFERS = {"smpte2084": "PQ", "arib-std-b67": "HLG"}
+# HDR -> SDR. Mobius keeps colours in the SDR range untouched and only rolls off the highlights.
+TONEMAP = ("zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=mobius:desat=0,"
+           "zscale=t=bt709:m=bt709:r=tv,format=yuv420p")
 # Keep FFmpeg/RIFE from popping up console windows when run from the windowed GUI.
 NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
@@ -123,7 +131,8 @@ def timed(report, seconds):
 def probe(ffprobe, path):
     out = run([
         ffprobe, "-v", "error", "-select_streams", "v:0",
-        "-show_entries", "stream=avg_frame_rate,r_frame_rate,width,height,nb_frames:format=duration",
+        "-show_entries", "stream=avg_frame_rate,r_frame_rate,width,height,nb_frames,color_transfer"
+                         ":format=duration",
         "-of", "json", path,
     ]).stdout
     info = json.loads(out)
@@ -139,6 +148,8 @@ def probe(ffprobe, path):
         "width": int(stream["width"]),
         "height": int(stream["height"]),
         "duration": float(info.get("format", {}).get("duration", 0) or 0),
+        # The transfer ("smpte2084" = PQ, "arib-std-b67" = HLG) when the video is HDR, else None.
+        "hdr": stream.get("color_transfer") if stream.get("color_transfer") in HDR_TRANSFERS else None,
     }
 
 
@@ -156,10 +167,18 @@ def scale_filter(width):
     return f"scale={width}:-2:flags=lanczos" if width else "null"
 
 
-def interpolate_rife(rife, ffmpeg, args, src_fps, target_fps, work, progress, clip, rife_hi=0.7):
-    """Extract frames, run RIFE to hit target_fps exactly, return (pattern, fps)."""
-    src_dir = work / "src"
-    out_dir = work / f"rife_{target_fps}"
+def source_filter(width, tonemap):
+    """Scale, then tone-map an HDR source down to SDR (scaling first makes the tone-map cheaper)."""
+    return f"{scale_filter(width)},{TONEMAP}" if tonemap else scale_filter(width)
+
+
+def interpolate_rife(rife, ffmpeg, args, src_vf, tag, src_fps, target_fps, work, progress, clip, rife_hi=0.7):
+    """Extract frames, run RIFE to hit target_fps exactly, return (pattern, fps).
+
+    RIFE only reads 8-bit images, so an HDR clip kept as HDR goes through it as 8-bit PQ/HLG.
+    """
+    src_dir = work / f"src{tag}"
+    out_dir = work / f"rife_{target_fps}{tag}"
     src_dir.mkdir(exist_ok=True)
     out_dir.mkdir(exist_ok=True)
 
@@ -167,7 +186,7 @@ def interpolate_rife(rife, ffmpeg, args, src_fps, target_fps, work, progress, cl
     if not any(src_dir.iterdir()):
         run([
             ffmpeg, "-hide_banner", "-y", *trim_args(args), "-i", args.input,
-            "-vf", scale_filter(args.width), "-fps_mode", "passthrough", "-pix_fmt", "rgb24",  # RIFE misreads RGBA
+            "-vf", src_vf, "-fps_mode", "passthrough", "-pix_fmt", "rgb24",  # RIFE misreads RGBA
             str(src_dir / "%08d.png"),
         ], on_progress=timed(report, clip))
 
@@ -200,17 +219,18 @@ def interpolate_rife(rife, ffmpeg, args, src_fps, target_fps, work, progress, cl
     return ["-framerate", str(target_fps), "-i", str(out_dir / "%08d.png")], "null"
 
 
-def interpolate_ffmpeg(args, target_fps):
+def interpolate_ffmpeg(args, src_vf, target_fps):
     """Return (input args, filter) that make FFmpeg interpolate on the fly."""
     vf = (
-        f"{scale_filter(args.width)},"
+        f"{src_vf},"
         f"minterpolate=fps={target_fps}:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1:scd=fdiff"
     )
     return [*trim_args(args), "-i", args.input], vf
 
 
-def encode(ffmpeg, fmt, inputs, vf, fps, out, on_progress=None, alpha=False, bg="black"):
-    """Encode one output. alpha=(width, height) means the input frames carry transparency (background removed)."""
+def encode(ffmpeg, fmt, inputs, vf, fps, out, on_progress=None, alpha=False, bg="black", hdr=None):
+    """Encode one output. alpha=(width, height) means the input frames carry transparency (background removed).
+    hdr = an HDR transfer from probe() makes AVIF a 10-bit HDR image with that transfer."""
     base = [ffmpeg, "-hide_banner", "-y", *inputs]
     if fmt == "gif":
         # Build one palette tuned to this clip, then dither against it.
@@ -238,10 +258,27 @@ def encode(ffmpeg, fmt, inputs, vf, fps, out, on_progress=None, alpha=False, bg=
         run([*base, *filters, "-an", "-c:v", "libx264", "-preset", "slow",
              "-crf", "23", "-pix_fmt", "yuv420p", "-movflags", "+faststart", out],
             on_progress=on_progress)
+    elif fmt == "avif":
+        # SVT-AV1 for the picture (fast); transparency is a second, greyscale AV1 stream, which
+        # only libaom can encode. Frames coming back from RIFE/matting are PNGs tagged as sRGB, so
+        # HDR output converts to BT.2020 YUV explicitly and re-tags the frames with the HDR transfer.
+        if hdr:
+            color = ("scale=out_color_matrix=bt2020:out_range=tv,format=yuv420p10le,"
+                     f"setparams=color_primaries=bt2020:color_trc={hdr}:colorspace=bt2020nc:range=tv")
+        else:
+            color = "format=yuv420p"
+        if alpha:
+            graph = f"[0:v]{vf},fps={fps},format=rgba,split[c][a];[c]{color}[cv];[a]alphaextract,format=gray[av]"
+            streams = ["-filter_complex", graph, "-map", "[cv]", "-map", "[av]",
+                       "-c:v:0", "libsvtav1", "-c:v:1", "libaom-av1", "-cpu-used:1", "6"]
+        else:
+            streams = ["-vf", f"{vf},fps={fps},{color}", "-c:v", "libsvtav1"]
+        run([*base, *streams, "-an", "-crf", "30", "-preset", "6", "-loop", "0", "-f", "avif", out],
+            on_progress=on_progress)
 
 
 def main():
-    p = argparse.ArgumentParser(description="Make a smooth high-fps GIF/WebP/APNG/MP4 from a short video.")
+    p = argparse.ArgumentParser(description="Make a smooth high-fps GIF/WebP/APNG/MP4/AVIF from a short video.")
     p.add_argument("input", help="input video file")
     p.add_argument("-o", "--output", help="output path (extension picks the format); default: next to input")
     p.add_argument("-f", "--format", choices=(*FORMATS, "all"), default="gif",
@@ -255,7 +292,9 @@ def main():
     p.add_argument("--rife-model", default="rife-v4.6", help="RIFE model folder (default: rife-v4.6)")
     p.add_argument("--gpu", type=int, help="GPU id for RIFE (-1 = CPU)")
     p.add_argument("--remove-bg", action="store_true",
-                   help="cut out the background with AI (transparent in WebP/APNG/GIF; needs matting model)")
+                   help="cut out the background with AI (transparent in WebP/APNG/AVIF/GIF; needs matting model)")
+    p.add_argument("--hdr", action="store_true",
+                   help="keep an HDR source as HDR: outputs a 10-bit HDR AVIF (default: tone-map to SDR)")
     p.add_argument("--bg-color", default="black", help="background colour for MP4 when using --remove-bg")
     p.add_argument("--keep-temp", action="store_true", help="keep extracted/interpolated frames")
     p.add_argument("-v", "--verbose", action="store_true")
@@ -278,7 +317,6 @@ def main():
     if args.output and args.format == "gif":
         ext = Path(args.output).suffix.lower().lstrip(".")
         args.format = {"png": "apng"}.get(ext, ext) if ext in (*FORMATS, "png") else "gif"
-    formats = FORMATS if args.format == "all" else (args.format,)
 
     if args.remove_bg:
         import matting
@@ -292,8 +330,19 @@ def main():
     engine = "rife" if rife else "ffmpeg"
 
     info = probe(ffprobe, inp)
+    hdr = info["hdr"]
+    hdr_note = f"  HDR ({HDR_TRANSFERS[hdr]})" if hdr else ""
     print(f"Input: {inp.name}  {info['width']}x{info['height']}  {info['fps']:.3f} fps  "
-          f"{info['duration']:.2f}s  | engine: {engine}")
+          f"{info['duration']:.2f}s{hdr_note}  | engine: {engine}")
+    if args.hdr and not hdr:
+        print("  note: source isn't HDR, so --hdr has no effect.")
+        args.hdr = False
+    if args.hdr and args.format not in ("avif", "all"):
+        print(f"  note: only AVIF can stay HDR; making an HDR AVIF instead of {args.format.upper()}.")
+        args.format = "avif"
+        if args.output:
+            args.output = str(Path(args.output).with_suffix(".avif"))
+    formats = FORMATS if args.format == "all" else (args.format,)
 
     clip = clip_seconds(args, info)
     progress = Progress(args.progress, len(formats))
@@ -301,6 +350,9 @@ def main():
     try:
         for progress.job, fmt in enumerate(formats):
             fps = args.fps or DEFAULT_FPS[fmt]
+            keep_hdr = hdr if args.hdr and fmt == "avif" else None
+            src_vf = source_filter(args.width, tonemap=hdr and not keep_hdr)
+            tag = "_hdr" if keep_hdr else ""  # tone-mapped and HDR frames are cached separately
             if fmt == "gif" and fps > GIF_MAX_FPS:
                 print(f"  note: GIF can't play reliably above {GIF_MAX_FPS} fps; using {GIF_MAX_FPS}.")
                 fps = GIF_MAX_FPS
@@ -308,28 +360,29 @@ def main():
             if args.output and len(formats) == 1:
                 out = Path(args.output)
             else:
-                suffix = {"gif": ".gif", "webp": ".webp", "apng": ".png", "mp4": ".mp4"}[fmt]
                 out = (Path(args.output).with_suffix("") if args.output else inp.with_suffix("")) \
-                    .with_name(f"{(Path(args.output) if args.output else inp).stem}_{fps}fps{suffix}")
+                    .with_name(f"{(Path(args.output) if args.output else inp).stem}_{fps}fps{SUFFIX[fmt]}")
 
-            print(f"\n[{fmt.upper()} @ {fps} fps] -> {out}")
+            print(f"\n[{fmt.upper()}{' HDR' if keep_hdr else ''} @ {fps} fps] -> {out}")
+            if keep_hdr and (args.remove_bg or (engine == "rife" and info["fps"] < fps - 0.01)):
+                print("  note: RIFE and the AI cutout work in 8-bit, so smooth HDR gradients may show banding.")
             interpolated = False
             if info["fps"] >= fps - 0.01:
                 print("  source already at/above target fps; resampling only")
-                inputs, vf = [*trim_args(args), "-i", str(inp)], scale_filter(args.width)
+                inputs, vf = [*trim_args(args), "-i", str(inp)], src_vf
             elif engine == "rife":
-                inputs, vf = interpolate_rife(rife, ffmpeg, args, info["fps"], fps, work, progress, clip,
-                                              rife_hi=0.5 if args.remove_bg else 0.7)
+                inputs, vf = interpolate_rife(rife, ffmpeg, args, src_vf, tag, info["fps"], fps, work, progress,
+                                              clip, rife_hi=0.5 if args.remove_bg else 0.7)
                 interpolated = True
             else:
-                inputs, vf = interpolate_ffmpeg(args, fps)
+                inputs, vf = interpolate_ffmpeg(args, src_vf, fps)
 
             encode_lo = 0.7 if interpolated else 0
             if args.remove_bg:
                 # Cut out every final frame (after interpolation: RIFE ignores alpha), once per fps.
                 lo, encode_lo = (0.5, 0.8) if interpolated else (0, 0.6)
                 report = progress.stage(lo, encode_lo, "Removing background")
-                matte_dir = work / f"matte_{fps}"
+                matte_dir = work / f"matte_{fps}{tag}"
                 if not (matte_dir / "done").is_file():
                     print("  removing background (AI)")
                     matting.matte_frames(ffmpeg, inputs, f"{vf},fps={fps}", fps, matte_dir, round(clip * fps), report)
@@ -341,7 +394,7 @@ def main():
             # libwebp_anim only emits output when it finishes, so FFmpeg reports no progress for it.
             report = progress.stage(encode_lo, 1, f"Encoding {fmt.upper()}", busy=fmt == "webp")
             encode(ffmpeg, fmt, inputs, vf, fps, out, on_progress=timed(report, clip),
-                   alpha=cutout_size if args.remove_bg else None, bg=args.bg_color)
+                   alpha=cutout_size if args.remove_bg else None, bg=args.bg_color, hdr=keep_hdr)
             report(1)
             size = out.stat().st_size / 1024 / 1024
             print(f"  done: {size:.2f} MB")

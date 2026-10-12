@@ -27,7 +27,6 @@ FROZEN = getattr(sys, "frozen", False)
 ICON = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)) / "icon.ico"
 
 VIDEO_TYPES = [("Videos", "*.mp4 *.mov *.mkv *.webm *.avi *.m4v *.gif *.wmv *.flv"), ("All files", "*.*")]
-SUFFIX = {"gif": ".gif", "webp": ".webp", "apng": ".png", "mp4": ".mp4"}
 NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
 # Palette
@@ -242,9 +241,9 @@ class FrameSource:
         self.results = queue.Queue()
         threading.Thread(target=self.loop, daemon=True).start()
 
-    def request(self, kind, *args):
+    def request(self, kind, *args, hdr=None):
         with self.cv:
-            self.pending[kind] = args
+            self.pending[kind] = args, hdr
             self.cv.notify()
 
     def loop(self):
@@ -253,15 +252,17 @@ class FrameSource:
                 while not self.pending:
                     self.cv.wait()
                 kind = "frame" if "frame" in self.pending else next(iter(self.pending))
-                args = self.pending.pop(kind)
-            self.results.put((kind, args, self.grab(kind, *args)))
+                args, hdr = self.pending.pop(kind)
+            self.results.put((kind, args, self.grab(kind, *args, hdr=hdr)))
 
     matter = None
 
-    def grab(self, kind, path, *rest):
+    def grab(self, kind, path, *rest, hdr=None):
+        # Tone-map before scaling: the tone-map ends in 4:2:0, which needs even sizes.
+        tonemap = f"{fpsgif.TONEMAP}," if hdr else ""
         if kind == "frame":
             t, w, h, cutout = rest
-            pre, vf = ["-ss", f"{t:.3f}"], f"scale={w}:{h}:force_original_aspect_ratio=decrease"
+            pre, vf = ["-ss", f"{t:.3f}"], f"{tonemap}scale={w}:{h}:force_original_aspect_ratio=decrease"
             if cutout:
                 try:
                     return self.cutout_frame(path, pre, vf)
@@ -270,7 +271,7 @@ class FrameSource:
         else:  # filmstrip from keyframes only: fast even for long videos
             duration, n, tw, th = rest
             pre = ["-skip_frame", "nokey"]
-            vf = (f"fps={n}/{duration:.3f},scale={tw}:{th}:force_original_aspect_ratio=increase,"
+            vf = (f"fps={n}/{duration:.3f},{tonemap}scale={tw}:{th}:force_original_aspect_ratio=increase,"
                   f"crop={tw}:{th},tile={n}x1")
         cmd = [fpsgif.find_exe("ffmpeg"), "-hide_banner", "-loglevel", "error", *pre, "-i", path, "-an",
                "-vf", vf, "-frames:v", "1", "-f", "image2pipe", "-c:v", "png", "-"]
@@ -310,7 +311,7 @@ class TrimPanel(ttk.Frame):
     def __init__(self, parent, start_var, duration_var, cutout_var):
         super().__init__(parent, style="Card.TFrame")
         self.start_var, self.duration_var, self.cutout_var = start_var, duration_var, cutout_var
-        self.path, self.duration, self.fps = None, 0.0, 30.0
+        self.path, self.duration, self.fps, self.hdr = None, 0.0, 30.0, None
         self.start = self.end = self.head = 0.0
         self.drag = None
         self.syncing = False
@@ -352,7 +353,7 @@ class TrimPanel(ttk.Frame):
     # ----- data -----
 
     def load(self, path, info):
-        self.path, self.duration = path, info["duration"]
+        self.path, self.duration, self.hdr = path, info["duration"], info["hdr"]
         self.fps = info["fps"] or 30.0
         self.start, self.end, self.head = 0.0, self.duration, 0.0
         self.frame_img = self.strip_img = None
@@ -375,7 +376,7 @@ class TrimPanel(ttk.Frame):
         w, h = self.preview.winfo_width() - 2, self.preview.winfo_height() - 2
         if w > 10 and h > 10:
             t = min(self.head, max(self.duration - 1.5 / self.fps, 0))  # seeking past the last frame yields nothing
-            self.frames.request("frame", self.path, round(t, 3), w, h, bool(self.cutout_var.get()))
+            self.frames.request("frame", self.path, round(t, 3), w, h, bool(self.cutout_var.get()), hdr=self.hdr)
 
     def request_strip(self):
         if not self.path:
@@ -387,7 +388,7 @@ class TrimPanel(ttk.Frame):
         key = (self.path, n, tw, th)
         if key != self.strip_key:
             self.strip_key = key
-            self.frames.request("strip", self.path, self.duration, n, tw, th)
+            self.frames.request("strip", self.path, self.duration, n, tw, th, hdr=self.hdr)
 
     def poll(self):
         try:
@@ -586,11 +587,15 @@ class App(tk.Tk):
         self.gpu_var = tk.StringVar()
         self.verbose_var = tk.BooleanVar()
         self.cutout_var = tk.BooleanVar()
+        self.hdr_var = tk.BooleanVar()
+        self.source_hdr = None  # the input's HDR transfer, or None for SDR
         self.advanced_open = False
 
         self.build()
         self.refresh_tools()
-        self.format_var.trace_add("write", lambda *_: (self.update_fps_hint(), self.update_cutout_hint()))
+        self.format_var.trace_add("write", lambda *_: (self.update_fps_hint(), self.update_cutout_hint(),
+                                                       self.sync_hdr("format")))
+        self.hdr_var.trace_add("write", lambda *_: self.sync_hdr("hdr"))
         self.update_fps_hint()
         self.after(100, self.drain_log)
 
@@ -640,7 +645,7 @@ class App(tk.Tk):
         header = ttk.Frame(root)
         header.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 14))
         ttk.Label(header, text="60fps GIF Maker", style="Title.TLabel").pack(anchor="w")
-        ttk.Label(header, text="Turn short clips into buttery-smooth GIF, WebP, APNG or MP4 "
+        ttk.Label(header, text="Turn short clips into buttery-smooth GIF, WebP, APNG, MP4 or AVIF "
                                "with AI frame interpolation.", style="Subtitle.TLabel").pack(anchor="w")
 
         # Left column: source + trim. Right column: settings, actions, output.
@@ -682,7 +687,7 @@ class App(tk.Tk):
         ttk.Label(opts, text="Format", style="Field.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 3))
         seg = tk.Frame(opts, bg=BORDER, padx=1, pady=1)
         seg.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(0, 12))
-        labels = {"gif": "GIF", "webp": "WebP", "apng": "APNG", "mp4": "MP4", "all": "All"}
+        labels = {"gif": "GIF", "webp": "WebP", "apng": "APNG", "mp4": "MP4", "avif": "AVIF", "all": "All"}
         for i, (value, text) in enumerate(labels.items()):
             seg.columnconfigure(i, weight=1, uniform="seg")
             ttk.Radiobutton(seg, text=text, value=value, variable=self.format_var,
@@ -710,9 +715,18 @@ class App(tk.Tk):
         self.cutout_hint.pack(anchor="w", pady=(4, 0))
         self.cutout_var.trace_add("write", lambda *_: self.update_cutout_hint())
 
-        self.adv_btn.grid(row=5, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        # Only shown for HDR sources: keep HDR (HDR AVIF) or pass through as SDR (tone-mapped).
+        self.hdr_row = ttk.Frame(opts, style="Card.TFrame")
+        self.hdr_row.grid(row=5, column=0, columnspan=4, sticky="ew", pady=(12, 0))
+        ttk.Checkbutton(self.hdr_row, text="Keep HDR (outputs HDR AVIF)", variable=self.hdr_var,
+                        style="Card.TCheckbutton").pack(anchor="w")
+        self.hdr_hint = ttk.Label(self.hdr_row, style="Hint.TLabel", wraplength=px(460))
+        self.hdr_hint.pack(anchor="w", pady=(4, 0))
+        self.hdr_row.grid_remove()
+
+        self.adv_btn.grid(row=6, column=0, columnspan=2, sticky="w", pady=(10, 0))
         self.adv = ttk.Frame(opts, style="Card.TFrame")
-        self.adv.grid(row=6, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        self.adv.grid(row=7, column=0, columnspan=4, sticky="ew", pady=(8, 0))
         for c in range(4):
             self.adv.columnconfigure(c, weight=1, uniform="adv")
         self.field(self.adv, "Engine",
@@ -855,8 +869,33 @@ class App(tk.Tk):
                     "webp": "WebP keeps smooth, semi-transparent edges.",
                     "apng": "APNG keeps smooth edges, but files are large.",
                     "mp4": "MP4 can't be transparent, so the background becomes black.",
-                    "all": "Transparent in GIF, WebP and APNG; MP4 gets a black background."}[self.format_var.get()]
+                    "avif": "AVIF keeps smooth, semi-transparent edges in small files.",
+                    "all": "Transparent in GIF, WebP, APNG and AVIF; MP4 gets a black background."
+                    }[self.format_var.get()]
         self.cutout_hint.config(text=text)
+
+    def set_source_hdr(self, hdr):
+        """Show the HDR toggle only for HDR sources."""
+        self.source_hdr = hdr
+        if hdr:
+            self.hdr_row.grid()
+            self.sync_hdr("hdr")
+        else:
+            self.hdr_row.grid_remove()
+
+    def sync_hdr(self, changed):
+        """Keep HDR and the format in step: HDR needs AVIF, and picking a format that can't be HDR turns it off."""
+        hdr_ok = self.format_var.get() in ("avif", "all")
+        if changed == "hdr" and self.hdr_var.get() and not hdr_ok:
+            self.format_var.set("avif")
+        elif changed == "format" and self.hdr_var.get() and not hdr_ok:
+            self.hdr_var.set(False)
+        if self.source_hdr:
+            kind = fpsgif.HDR_TRANSFERS[self.source_hdr]
+            self.hdr_hint.config(text=(
+                f"HDR video ({kind}). The AVIF stays 10-bit HDR and looks brightest on an HDR screen; "
+                "with All, the other formats are tone-mapped." if self.hdr_var.get() else
+                f"HDR video ({kind}). Off: tone-mapped to normal SDR colours for every format."))
 
     def update_fps_hint(self):
         fmt = self.format_var.get()
@@ -933,11 +972,14 @@ class App(tk.Tk):
         def work():
             try:
                 info = fpsgif.probe(ffprobe, path)
+                hdr = f"   ·   HDR ({fpsgif.HDR_TRANSFERS[info['hdr']]})" if info["hdr"] else ""
                 text = (f"{info['width']} × {info['height']}   ·   {info['fps']:.2f} fps   ·   "
-                        f"{info['duration']:.2f} s      Click to change")
+                        f"{info['duration']:.2f} s{hdr}      Click to change")
                 self.after(0, self.trim.load, path, info)
+                self.after(0, self.set_source_hdr, info["hdr"])
             except (SystemExit, Exception):
                 text = "Could not read video info (is FFmpeg installed?)"
+                self.after(0, self.set_source_hdr, None)
             self.after(0, self.drop.set_text, name, text)
 
         threading.Thread(target=work, daemon=True).start()
@@ -953,7 +995,7 @@ class App(tk.Tk):
         fps = int(self.fps_var.get() or fpsgif.DEFAULT_FPS[fmt])
         if fmt == "gif":
             fps = min(fps, fpsgif.GIF_MAX_FPS)
-        return ["-o", str(Path(outdir) / f"{inp.stem}_{fps}fps{SUFFIX[fmt]}")]
+        return ["-o", str(Path(outdir) / f"{inp.stem}_{fps}fps{fpsgif.SUFFIX[fmt]}")]
 
     def build_cmd(self):
         inp = Path(self.input_var.get().strip().strip('"'))
@@ -981,6 +1023,8 @@ class App(tk.Tk):
             cmd += ["--gpu", self.gpu_var.get().strip()]
         if self.cutout_var.get():
             cmd.append("--remove-bg")
+        if self.source_hdr and self.hdr_var.get():
+            cmd.append("--hdr")
         if self.verbose_var.get():
             cmd.append("-v")
         return cmd

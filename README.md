@@ -1,6 +1,6 @@
 # 60fpsgif or try to anyways
 
-Turn a short video into a buttery-smooth, high-frame-rate GIF (or WebP / APNG / MP4) using AI frame interpolation.
+Turn a short video into a buttery-smooth, high-frame-rate GIF (or WebP / APNG / MP4 / AVIF) using AI frame interpolation.
 
 ## Examples
 
@@ -81,14 +81,15 @@ This creates `dist/60fps GIF Maker.exe`, a single file you can put anywhere (des
 python fpsgif.py clip.mp4                      # -> clip_50fps.gif
 python fpsgif.py clip.mp4 -o smooth.webp       # true 60 fps WebP
 python fpsgif.py clip.mp4 -o smooth.mp4        # tiny 60 fps "GIF video" (like Imgur's .gifv)
-python fpsgif.py clip.mp4 -f all               # GIF + WebP + APNG + MP4
+python fpsgif.py clip.mp4 -o smooth.avif      # small 60 fps AVIF (can be transparent or HDR)
+python fpsgif.py clip.mp4 -f all               # GIF + WebP + APNG + MP4 + AVIF
 python fpsgif.py clip.mp4 -s 3 -t 4 -w 360     # 4 s starting at 0:03, 360 px wide
 ```
 
 | Option | Meaning |
 |---|---|
 | `-o, --output` | Output file; extension picks the format |
-| `-f, --format` | `gif` (default), `webp`, `apng`, `mp4`, or `all` |
+| `-f, --format` | `gif` (default), `webp`, `apng`, `mp4`, `avif`, or `all` |
 | `--fps` | Target fps (default 50 for GIF, 60 for others) |
 | `-w, --width` | Output width, `0` = original (default 480) |
 | `-s, --start` / `-t, --duration` | Trim the clip |
@@ -97,6 +98,7 @@ python fpsgif.py clip.mp4 -s 3 -t 4 -w 360     # 4 s starting at 0:03, 360 px wi
 | `--gpu` | GPU id for RIFE (`-1` = CPU) |
 | `--remove-bg` | Cut out the background with AI (see below) |
 | `--bg-color` | Background colour for MP4 with `--remove-bg` (default `black`) |
+| `--hdr` | Keep an HDR source as HDR, written as a 10-bit HDR AVIF (see below) |
 
 ## Remove the background
 
@@ -106,15 +108,34 @@ It uses [RobustVideoMatting](https://github.com/PeterL1n/RobustVideoMatting), a 
 
 | Format | Result |
 |---|---|
-| WebP / APNG | Smooth, semi-transparent edges |
+| WebP / APNG / AVIF | Smooth, semi-transparent edges |
 | GIF | Transparent, but GIF can only make a pixel fully on or off, so edges are harder |
 | MP4 | H.264 can't be transparent, so the background becomes a solid colour (`--bg-color`) |
 
 The cutout runs after interpolation, on every final frame, because RIFE ignores transparency. It works best on clearly visible people or characters. Fast motion blur, particles and glow effects can leave soft or flickering edges.
 
+## HDR video
+
+GIF, WebP, APNG and the H.264 MP4 are all 8-bit SDR, so HDR can't survive in them. AVIF can: it stores 10-bit colour with the HDR brightness range (PQ or HLG), and Chrome, Firefox and Safari play animated AVIF.
+
+When the input is HDR (an iPhone HDR video, an HDR game capture), the app shows a **Keep HDR (outputs HDR AVIF)** toggle, and the CLI takes `--hdr`:
+
+- **Off (default):** every format is tone-mapped to normal SDR colours. Without this an HDR clip comes out grey and washed out.
+- **On:** the output is a 10-bit HDR AVIF. With `-f all`, only the AVIF is HDR and the rest are tone-mapped.
+
+```
+python fpsgif.py hdr_clip.mov --hdr -o smooth.avif
+```
+
+Things to know:
+
+- HDR only looks like HDR on an HDR screen with HDR turned on (on Windows: Settings → Display → Use HDR). Elsewhere the viewer tone-maps it.
+- RIFE and the AI cutout work on 8-bit images, so frames they touch carry the HDR signal in 8 bits, and smooth gradients like skies can band slightly. With no interpolation (source already at the target fps), the AVIF is 10-bit from end to end.
+- Many sites re-encode uploads and may drop HDR. AVIF keeps it when the file is served as-is.
+
 ## Why GIFs are capped at 50 fps
 
-GIF stores frame delays in 1/100 s units, so 60 fps (16.67 ms) can't be represented, and browsers slow any delay under 20 ms down to ~100 ms. **50 fps is the highest GIF rate that plays correctly everywhere.** For real 60 fps, use WebP (smaller, widely supported) or APNG (lossless, large).
+GIF stores frame delays in 1/100 s units, so 60 fps (16.67 ms) can't be represented, and browsers slow any delay under 20 ms down to ~100 ms. **50 fps is the highest GIF rate that plays correctly everywhere.** For real 60 fps, use WebP (smaller, widely supported), AVIF (smaller still, all current browsers) or APNG (lossless, large).
 
 ## Why MP4 is so much smaller
 
