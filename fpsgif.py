@@ -53,13 +53,15 @@ def run(cmd, quiet=True, on_progress=None):
             stdout=subprocess.PIPE if quiet else None,
             stderr=subprocess.PIPE if quiet else None,
             text=True,
+            encoding="utf-8",  # FFmpeg prints UTF-8; the locale code page can't hold every file name
+            errors="replace",
             creationflags=NO_WINDOW,
         )
     else:
         cmd = [cmd[0], "-nostats", "-progress", "pipe:1", *cmd[1:]]
         with tempfile.TemporaryFile("w+", encoding="utf-8", errors="replace") as err:
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=err if quiet else None,
-                                    text=True, creationflags=NO_WINDOW)
+                                    text=True, encoding="utf-8", errors="replace", creationflags=NO_WINDOW)
             for line in proc.stdout:
                 key, _, value = line.strip().partition("=")
                 if key == "out_time_us" and value.isdigit():
@@ -259,6 +261,11 @@ def main():
     p.add_argument("-v", "--verbose", action="store_true")
     p.add_argument("--progress", action="store_true", help=argparse.SUPPRESS)  # machine-readable, for the GUI
     args = p.parse_args()
+    # File names can hold characters the console's code page can't show (e.g. emoji on cp932);
+    # print a placeholder instead of crashing.
+    for stream in (sys.stdout, sys.stderr):
+        if stream:
+            stream.reconfigure(errors="replace")
 
     ffmpeg, ffprobe = find_exe("ffmpeg"), find_exe("ffprobe")
     if not ffmpeg or not ffprobe:

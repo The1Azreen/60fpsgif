@@ -79,7 +79,9 @@ def child_cmd(task):
 
 def run_child(task):
     """Entry point for `<exe> --run-cli ...` / `<exe> --run-setup`."""
-    sys.stdout.reconfigure(line_buffering=True)
+    # The GUI reads the child's output as UTF-8, whatever the system code page is.
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
     sys.argv = [sys.argv[0], *sys.argv[2:]]
     (fpsgif.main if task == "cli" else setup_tools.main)()
 
