@@ -262,18 +262,24 @@ def encode(ffmpeg, fmt, inputs, vf, fps, out, on_progress=None, alpha=False, bg=
         # SVT-AV1 for the picture (fast); transparency is a second, greyscale AV1 stream, which
         # only libaom can encode. Frames coming back from RIFE/matting are PNGs tagged as sRGB, so
         # HDR output converts to BT.2020 YUV explicitly and re-tags the frames with the HDR transfer.
+        # 10-bit SVT-AV1 AVIFs render as a blank box in Chrome, so HDR uses libaom for the picture too.
         if hdr:
             color = ("scale=out_color_matrix=bt2020:out_range=tv,format=yuv420p10le,"
                      f"setparams=color_primaries=bt2020:color_trc={hdr}:colorspace=bt2020nc:range=tv")
+            picture = "libaom-av1"
         else:
             color = "format=yuv420p"
+            picture = "libsvtav1"
         if alpha:
             graph = f"[0:v]{vf},fps={fps},format=rgba,split[c][a];[c]{color}[cv];[a]alphaextract,format=gray[av]"
             streams = ["-filter_complex", graph, "-map", "[cv]", "-map", "[av]",
-                       "-c:v:0", "libsvtav1", "-c:v:1", "libaom-av1", "-cpu-used:1", "6"]
+                       "-c:v:0", picture, "-c:v:1", "libaom-av1"]
         else:
-            streams = ["-vf", f"{vf},fps={fps},{color}", "-c:v", "libsvtav1"]
-        run([*base, *streams, "-an", "-crf", "30", "-preset", "6", "-loop", "0", "-f", "avif", out],
+            streams = ["-vf", f"{vf},fps={fps},{color}", "-c:v", picture]
+        speed = ["-cpu-used", "6", "-row-mt", "1"]  # libaom's speed knobs; SVT-AV1 uses -preset
+        if picture == "libsvtav1":
+            speed = ["-preset:v:0", "6", *(["-cpu-used:v:1", "6", "-row-mt:v:1", "1"] if alpha else [])]
+        run([*base, *streams, "-an", "-crf", "30", *speed, "-loop", "0", "-f", "avif", out],
             on_progress=on_progress)
 
 
