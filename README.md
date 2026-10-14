@@ -141,6 +141,34 @@ GIF stores frame delays in 1/100 s units, so 60 fps (16.67 ms) can't be represen
 
 Sites like Imgur don't actually serve GIFs — they convert them to silent, looping MP4 (`.gifv`). A video codec stores only what *changes* between frames, in full color, instead of a whole 256-color image per frame. The full 25 s source clip at 480 px came out at **85 MB as GIF, 20 MB as WebP, and 2.3 MB as MP4**. Use MP4 anywhere that plays video inline (Discord, X, Reddit, `<video autoplay loop muted playsinline>`); use GIF only where a real `.gif` is required.
 
+## Shrink images and audio for the web
+
+`webshrink.py` converts a site's PNG/JPEG images to WebP and its MP3/FLAC/WAV audio to Opus, keeping the same quality. Point it at files or whole folders:
+
+```
+python webshrink.py site/assets                    # converts every image/audio file, writes next to each one
+python webshrink.py site/assets -o site/optimized  # writes to another folder, keeping subfolders
+python webshrink.py logo.png song.flac --audio m4a
+```
+
+| Input | Output | Quality | Typical saving |
+|---|---|---|---|
+| PNG | WebP, lossless | Every pixel identical, transparency kept | 20–50% |
+| JPEG | WebP at the JPEG's own quality | Looks the same (quality is read from the file, capped at 90) | 15–35% |
+| FLAC / WAV | Opus 128 kbps (64 mono) | Sounds the same to nearly everyone | 85–90% |
+| MP3 | Opus at ¾ of the MP3's bitrate (max 128) | Sounds the same; it never gets more bits than the source had | 40–70% |
+
+| Option | Meaning |
+|---|---|
+| `-o, --out-dir` | Write results here instead of next to the originals |
+| `-q, --quality` | Fixed WebP quality for JPEGs (and PNGs with `--lossy-png`) |
+| `--lossy-png` | Lossy WebP for PNGs. Much smaller for photos saved as PNG, but no longer pixel-identical |
+| `--audio` | `opus` (default, smallest) or `m4a` (AAC, for very old Safari/iOS) |
+| `-b, --bitrate` | Audio bitrate in kbps |
+| `--keep-larger` | Keep a result even if it isn't smaller (by default it's skipped) |
+
+Originals are never changed or deleted. If a WebP or Opus file wouldn't be smaller than the original (common for tiny or already heavily compressed JPEGs), the file is skipped. EXIF rotation is applied. EXIF data, including GPS, is removed, and so are embedded colour profiles, so wide-gamut (Display P3) photos may look slightly less saturated. Audio keeps its tags (title, artist…) but loses embedded cover art. All current browsers play WebP and Opus (`<img src="x.webp">`, `<audio src="x.opus">`). Remember to update your HTML/CSS to point at the new files.
+
 ## Tips
 
 - Keep clips short (< 10 s) and narrow (≤ 480 px) — high-fps GIFs get big fast.
