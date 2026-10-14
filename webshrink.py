@@ -133,6 +133,7 @@ def main():
                    help="audio format: opus (smallest, default) or m4a (AAC, plays everywhere)")
     p.add_argument("-b", "--bitrate", type=int, help="audio bitrate in kbps (default: 128 Opus / 192 AAC stereo)")
     p.add_argument("--keep-larger", action="store_true", help="keep results even when not smaller than the original")
+    p.add_argument("--progress", action="store_true", help=argparse.SUPPRESS)  # machine-readable, for the GUI
     args = p.parse_args()
     for stream in (sys.stdout, sys.stderr):
         if stream:
@@ -144,7 +145,12 @@ def main():
 
     before = after = done = skipped = failed = 0
     written = set()
-    for src, base in collect(args.inputs):
+    files = list(collect(args.inputs))
+    if not files:
+        print("No PNG, JPEG, MP3, FLAC or WAV files found.")
+    for i, (src, base) in enumerate(files):
+        if args.progress:
+            print(f"@@progress {100 * i / len(files):.1f} Shrinking {src.name} ({i + 1}/{len(files)})", flush=True)
         is_image = src.suffix.lower() in IMAGE_EXTS
         if not is_image and src.suffix.lower() not in AUDIO_EXTS:
             print(f"  skip {src.name}: not a PNG, JPEG, MP3, FLAC or WAV")
@@ -167,7 +173,7 @@ def main():
                                 capture_output=True, text=True, encoding="utf-8", errors="replace",
                                 creationflags=NO_WINDOW)
         if result.returncode != 0 or not out.is_file():
-            print(f"  FAILED {src.name}: {result.stderr.strip().splitlines()[-1:] or ['unknown error']}")
+            print(f"  Failed {src.name}: {result.stderr.strip().splitlines()[-1:] or ['unknown error']}")
             failed += 1
             continue
 
@@ -180,6 +186,8 @@ def main():
         written.add(out.resolve())
         before, after, done = before + old, after + new, done + 1
         print(f"  {src.name} -> {out.name}  {human(old)} -> {human(new)}  ({(new - old) / old:+.0%}, {how})")
+        if args.progress:
+            print(f"@@output {out}", flush=True)
 
     print(f"\n{done} converted, {skipped} skipped, {failed} failed.", end="")
     if done:

@@ -64,7 +64,7 @@ python setup_tools.py --matting
 
 ![60fps GIF Maker desktop app](readme_image/app.png)
 
-Prefer clicking to typing? Double-click **`fpsgif_gui.pyw`** (or run `python fpsgif_gui.pyw`). Pick a video, scrub through it in the **Preview & trim** panel and drag the handles to select the part you want, choose the format, fps and width, then hit **Convert**. Progress streams into the log, and **Open result** / **Show in folder** take you to the file. If RIFE isn't installed yet, the app shows an **Install RIFE** button. It uses only Python's built-in tkinter, so nothing extra needs installing.
+Prefer clicking to typing? Double-click **`fpsgif_gui.pyw`** (or run `python fpsgif_gui.pyw`). Pick a video, scrub through it in the **Preview & trim** panel and drag the handles to select the part you want, choose the format, fps and width, then hit **Convert**. Progress streams into the log, and **Open result** / **Show in folder** take you to the file. If RIFE isn't installed yet, the app shows an **Install RIFE** button. It uses only Python's built-in tkinter, so nothing extra needs installing. **Shrink images & audio…** (top right) does the same as [`webshrink.py`](#shrink-images-and-audio-for-the-web): add files or folders and it converts them to WebP / Opus.
 
 ### Build a standalone .exe
 

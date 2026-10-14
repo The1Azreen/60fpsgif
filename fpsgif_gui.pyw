@@ -21,12 +21,15 @@ from tkinter import filedialog, messagebox, ttk
 import fpsgif
 import matting
 import setup_tools
+import webshrink
 
 ROOT = fpsgif.ROOT
 FROZEN = getattr(sys, "frozen", False)
 ICON = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)) / "icon.ico"
 
 VIDEO_TYPES = [("Videos", "*.mp4 *.mov *.mkv *.webm *.avi *.m4v *.gif *.wmv *.flv"), ("All files", "*.*")]
+SHRINK_TYPES = [("Images and audio", "*.png *.jpg *.jpeg *.mp3 *.flac *.wav"), ("All files", "*.*")]
+CHILDREN = {"cli": fpsgif, "setup": setup_tools, "shrink": webshrink}
 NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
 # Palette
@@ -66,23 +69,22 @@ def python_exe():
 
 
 def child_cmd(task):
-    """Command that runs fpsgif.py ("cli") or setup_tools.py ("setup") in a subprocess.
+    """Command that runs fpsgif.py ("cli"), setup_tools.py ("setup") or webshrink.py ("shrink") in a subprocess.
 
     A packaged .exe has no Python to hand the scripts to, so it re-launches itself with a flag instead.
     """
     if FROZEN:
         return [sys.executable, f"--run-{task}"]
-    script = {"cli": fpsgif.__file__, "setup": setup_tools.__file__}[task]
-    return [python_exe(), "-u", str(script)]
+    return [python_exe(), "-u", str(CHILDREN[task].__file__)]
 
 
 def run_child(task):
-    """Entry point for `<exe> --run-cli ...` / `<exe> --run-setup`."""
+    """Entry point for `<exe> --run-cli ...` / `<exe> --run-setup` / `<exe> --run-shrink ...`."""
     # The GUI reads the child's output as UTF-8, whatever the system code page is.
     sys.stdout.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
     sys.argv = [sys.argv[0], *sys.argv[2:]]
-    (fpsgif.main if task == "cli" else setup_tools.main)()
+    CHILDREN[task].main()
 
 
 def open_path(path):
@@ -599,12 +601,13 @@ class App(tk.Tk):
         self.update_fps_hint()
         self.after(100, self.drain_log)
 
-    def dark_title_bar(self):
+    def dark_title_bar(self, win=None):
         if sys.platform != "win32":
             return
+        win = win or self
         try:
-            self.update_idletasks()
-            hwnd = ctypes.windll.user32.GetParent(self.winfo_id())
+            win.update_idletasks()
+            hwnd = ctypes.windll.user32.GetParent(win.winfo_id())
             value = ctypes.c_int(1)
             ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 20, ctypes.byref(value), ctypes.sizeof(value))
         except Exception:
@@ -644,6 +647,8 @@ class App(tk.Tk):
         # Header
         header = ttk.Frame(root)
         header.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 14))
+        self.shrink_btn = ttk.Button(header, text="Shrink images & audio…", command=lambda: ShrinkDialog(self))
+        self.shrink_btn.pack(side="right", anchor="n")
         ttk.Label(header, text="60fps GIF Maker", style="Title.TLabel").pack(anchor="w")
         ttk.Label(header, text="Turn short clips into buttery-smooth GIF, WebP, APNG, MP4 or AVIF "
                                "with AI frame interpolation.", style="Subtitle.TLabel").pack(anchor="w")
@@ -925,6 +930,9 @@ class App(tk.Tk):
                 if item is None:
                     self.finished()
                     continue
+                if item.startswith("@@output "):  # a file webshrink.py wrote
+                    self.outputs.append(item[9:].rstrip())
+                    continue
                 if item.startswith(("@@progress ", "@@busy ")):
                     kind, pct, label = item.rstrip().split(" ", 2)
                     self.show_progress(float(pct), label, busy=kind == "@@busy")
@@ -1036,6 +1044,7 @@ class App(tk.Tk):
         self.convert_btn.config(state="disabled", text="Converting…" if label == "Converting" else "Convert")
         self.install_btn.config(state="disabled")
         self.cutout_btn.config(state="disabled")
+        self.shrink_btn.config(state="disabled")
         self.cancel_btn.config(state="normal")
         self.open_btn.config(state="disabled")
         self.folder_btn.config(state="disabled")
@@ -1075,6 +1084,7 @@ class App(tk.Tk):
         self.convert_btn.config(state="normal", text="Convert")
         self.install_btn.config(state="normal")
         self.cutout_btn.config(state="normal")
+        self.shrink_btn.config(state="normal")
         self.cancel_btn.config(state="disabled")
         self.refresh_tools()
 
@@ -1136,8 +1146,119 @@ class App(tk.Tk):
         super().destroy()
 
 
+class ShrinkDialog(tk.Toplevel):
+    """Pick images/audio and options for webshrink.py, then run it in the main window's log."""
+
+    def __init__(self, app):
+        super().__init__(app)
+        self.app = app
+        self.paths = []
+        self.outdir_var = tk.StringVar()
+        self.audio_var = tk.StringVar(value="opus")
+        self.lossy_var = tk.BooleanVar()
+        self.title("Shrink images & audio")
+        self.configure(bg=BG)
+        self.transient(app)
+        self.resizable(False, False)
+
+        wrap = ttk.Frame(self, padding=(px(18), px(16)))
+        wrap.pack(fill="both", expand=True)
+        card, body = app.card(wrap, "Shrink for the web")
+        card.pack(fill="both", expand=True)
+        ttk.Label(body, text="PNG → lossless WebP, JPEG → WebP at the same quality, MP3 / FLAC / WAV → Opus. "
+                             "Originals are kept, and files that wouldn't get smaller are skipped.",
+                  style="Hint.TLabel", wraplength=px(440)).pack(anchor="w")
+
+        pick = ttk.Frame(body, style="Card.TFrame")
+        pick.pack(fill="x", pady=(14, 0))
+        ttk.Button(pick, text="Add files…", style="Card.TButton", command=self.add_files).pack(side="left")
+        ttk.Button(pick, text="Add folder…", style="Card.TButton", command=self.add_folder).pack(
+            side="left", padx=(10, 0))
+        ttk.Button(pick, text="Clear", style="Link.TButton", command=self.clear).pack(side="right")
+        self.list_label = ttk.Label(body, style="Card.TLabel", wraplength=px(440), justify="left")
+        self.list_label.pack(anchor="w", pady=(8, 0))
+
+        save = ttk.Frame(body, style="Card.TFrame")
+        save.pack(fill="x", pady=(14, 0))
+        save.columnconfigure(0, weight=1)
+        ttk.Label(save, text="Save to", style="Field.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 3))
+        ttk.Entry(save, textvariable=self.outdir_var).grid(row=1, column=0, sticky="ew")
+        ttk.Button(save, text="Browse", style="Card.TButton", command=self.pick_outdir).grid(
+            row=1, column=1, padx=(10, 0))
+        ttk.Label(save, text="Leave blank to save next to each original. Subfolders are kept.",
+                  style="Hint.TLabel").grid(row=2, column=0, sticky="w", pady=(4, 0))
+
+        ttk.Label(body, text="Audio format", style="Field.TLabel").pack(anchor="w", pady=(14, 3))
+        seg = tk.Frame(body, bg=BORDER, padx=1, pady=1)
+        seg.pack(fill="x")
+        for i, (value, text) in enumerate((("opus", "Opus (smallest)"), ("m4a", "M4A / AAC (plays everywhere)"))):
+            seg.columnconfigure(i, weight=1, uniform="seg")
+            ttk.Radiobutton(seg, text=text, value=value, variable=self.audio_var,
+                            style="Seg.Toolbutton").grid(row=0, column=i, sticky="ew")
+
+        ttk.Checkbutton(body, text="Lossy PNG", variable=self.lossy_var, style="Card.TCheckbutton").pack(
+            anchor="w", pady=(14, 0))
+        ttk.Label(body, text="Much smaller for photos saved as PNG, but no longer pixel-identical. "
+                             "Leave off for logos, icons and screenshots.",
+                  style="Hint.TLabel", wraplength=px(440)).pack(anchor="w", pady=(4, 0))
+
+        actions = ttk.Frame(wrap)
+        actions.pack(fill="x", pady=(14, 0))
+        ttk.Button(actions, text="Shrink", style="Accent.TButton", command=self.run).pack(side="left")
+        ttk.Button(actions, text="Close", command=self.destroy).pack(side="left", padx=(10, 0))
+
+        self.refresh()
+        app.dark_title_bar(self)
+        self.update_idletasks()
+        x = app.winfo_rootx() + (app.winfo_width() - self.winfo_width()) // 2
+        y = app.winfo_rooty() + (app.winfo_height() - self.winfo_height()) // 3
+        self.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        self.grab_set()
+
+    def refresh(self):
+        if not self.paths:
+            self.list_label.config(text="Nothing added yet.", foreground=MUTED)
+            return
+        names = [Path(p).name + ("\\" if Path(p).is_dir() else "") for p in self.paths]
+        more = f"\n…and {len(names) - 6} more" if len(names) > 6 else ""
+        self.list_label.config(text="\n".join(names[:6]) + more, foreground=TEXT)
+
+    def add_files(self):
+        paths = filedialog.askopenfilenames(parent=self, title="Choose images or audio", filetypes=SHRINK_TYPES)
+        self.paths += [p for p in paths if p not in self.paths]
+        self.refresh()
+
+    def add_folder(self):
+        path = filedialog.askdirectory(parent=self, title="Choose a folder (searched with its subfolders)")
+        if path and path not in self.paths:
+            self.paths.append(path)
+            self.refresh()
+
+    def clear(self):
+        self.paths = []
+        self.refresh()
+
+    def pick_outdir(self):
+        path = filedialog.askdirectory(parent=self, title="Choose output folder")
+        if path:
+            self.outdir_var.set(path)
+
+    def run(self):
+        outdir = self.outdir_var.get().strip()
+        if not self.paths:
+            messagebox.showwarning("Nothing to shrink", "Add some files or a folder first.", parent=self)
+            return
+        if outdir and not Path(outdir).is_dir():
+            messagebox.showwarning("Check your settings", "Output folder does not exist.", parent=self)
+            return
+        cmd = [*child_cmd("shrink"), "--progress", *self.paths, "--audio", self.audio_var.get(),
+               *(["-o", outdir] if outdir else []), *(["--lossy-png"] if self.lossy_var.get() else [])]
+        self.destroy()
+        self.app.start(cmd, "Shrinking")
+
+
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] in ("--run-cli", "--run-setup"):
+    if len(sys.argv) > 1 and sys.argv[1] in ("--run-cli", "--run-setup", "--run-shrink"):
         sys.exit(run_child(sys.argv[1][6:]))
     if sys.platform == "win32":
         try:
